@@ -31,7 +31,7 @@ export function pickAndRegister (
 
     if (upstream.statusCode === expectedStatus) {
       const id = registerIdFrom(body)
-      await registry.registerResource(id, member.memberId)
+      await registry.registerInstance(id, member.memberId)
       registry.metrics?.requestsTotal.inc({ route, result: 'spawned' })
     } else {
       registry.metrics?.requestsTotal.inc({ route, result: 'upstream_error' })

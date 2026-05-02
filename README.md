@@ -1,25 +1,25 @@
 # @platformatic/coordinator
 
-Sticky-resource coordinator library for multi-pod Fastify services. Routes a client's request -- carrying a resource id -- to the pod that owns that resource, using Redis as the source of truth. Provides a member registry, allocation strategies, three Fastify helpers for the common sticky-routing patterns, and small utilities for the parts that are easy to get wrong.
+Sticky-instance coordinator library for multi-pod Fastify services. Routes a client's request -- carrying an instance id -- to the pod that owns that instance, using Redis as the source of truth. Provides a member registry, allocation strategies, three Fastify helpers for the common sticky-routing patterns, and small utilities for the parts that are easy to get wrong.
 
 This package is a library, not a Watt stackable. It is consumed by **preset stackables** (e.g. `@platformatic/regina-coordinator`) that publish their own API contract on top.
 
 ## What it solves
 
-You have N pods, each holding stateful resources (chat sessions, connection pools, simulations, sandboxes). A client request carries a resource id. You need that request to land on the pod that owns that resource. When pods die, surviving pods should be able to take over (assuming they can rehydrate from shared state). Allocation of new resources should spread across pods.
+You have N pods, each holding stateful instances (chat sessions, connection pools, simulations, sandboxes). A client request carries an instance id. You need that request to land on the pod that owns that instance. When pods die, surviving pods should be able to take over (assuming they can rehydrate from shared state). Allocation of new instances should spread across pods.
 
 ## Concepts
 
 - **Member** -- a pod, identified by `memberId`, advertising its address. The pod registers itself in Redis on startup and keeps its address key alive with a TTL it refreshes from a heartbeat loop.
-- **Resource** -- an opaque id whose ownership is bound to a member. The coordinator writes this binding when a resource is created and reads it on every subsequent request.
-- **Sticky mapping** -- `resource -> member`, **no TTL**. Outlives the member's address key, which is what makes orphan detection possible.
-- **Allocation strategy** -- how a fresh resource is assigned to a member: round-robin, least-loaded, or random.
+- **Instance** -- an opaque id whose ownership is bound to a member. The coordinator writes this binding when an instance is created and reads it on every subsequent request.
+- **Sticky mapping** -- `instance -> member`, **no TTL**. Outlives the member's address key, which is what makes orphan detection possible.
+- **Allocation strategy** -- how a fresh instance is assigned to a member: round-robin, least-loaded, or random.
 
 ## How a request is routed
 
 ```mermaid
 graph TB
-    Client([Client]) -->|"POST /resources/<id>/work"| App[Fastify app]
+    Client([Client]) -->|"POST /instances/<id>/work"| App[Fastify app]
 
     subgraph Library["@platformatic/coordinator"]
         App --> Helper["lookupAndProxy"]
@@ -28,13 +28,13 @@ graph TB
     end
 
     Registry <--> Redis[("Redis / Valkey")]
-    Proxy -->|"undici"| Pod1["Pod owning the resource"]
+    Proxy -->|"undici"| Pod1["Pod owning the instance"]
     Pod1 --> Helper
     Helper --> App
     App --> Client
 ```
 
-Per request: two Redis reads (resource mapping, then member address) plus one upstream HTTP call. Stateless across coordinator replicas because Redis is the source of truth.
+Per request: two Redis reads (instance mapping, then member address) plus one upstream HTTP call. Stateless across coordinator replicas because Redis is the source of truth.
 
 ## Install
 
@@ -52,10 +52,10 @@ With `keyPrefix: 'myservice'`:
 |-------------------------------------------|--------|-------------|-----------------------------------------|
 | `myservice:members`                       | set    | pod         | the pod's `memberId` lives here         |
 | `myservice:member:<memberId>`             | string | pod         | pod's address; TTL refreshed by heartbeat |
-| `myservice:member:<memberId>:resources`   | string | pod         | pod's resource count (for `least-loaded`) |
-| `myservice:resource:<resourceId>`         | string | coordinator | binds resource to memberId, **no TTL**  |
+| `myservice:member:<memberId>:instances`   | string | pod         | pod's instance count (for `least-loaded`) |
+| `myservice:instance:<instanceId>`         | string | coordinator | binds instance to memberId, **no TTL**  |
 
-The coordinator only writes the `:resource:` keys. Everything under `:members` and `:member:*` is owned by the pods themselves.
+The coordinator only writes the `:instance:` keys. Everything under `:members` and `:member:*` is owned by the pods themselves.
 
 ## Pod responsibilities
 
@@ -69,8 +69,8 @@ A pod that wants to participate in a coordinator-managed mesh must:
 2. **Heartbeat every ~10s** to refresh the TTL on `<prefix>:member:<memberId>`. Skipping this is what marks the pod dead.
 3. **(Optional) Track load** for the `least-loaded` strategy:
    ```
-   INCR <prefix>:member:<memberId>:resources   # on resource create
-   DECR <prefix>:member:<memberId>:resources   # on resource close
+   INCR <prefix>:member:<memberId>:instances   # on instance create
+   DECR <prefix>:member:<memberId>:instances   # on instance close
    ```
 4. **Deregister on graceful shutdown**:
    ```
@@ -84,9 +84,9 @@ The library does not provide pod-side helpers -- pods are typically a different 
 
 ```mermaid
 flowchart TD
-    A[New resource] --> B[Registry.listMembersWithLoad]
+    A[New instance] --> B[Registry.listMembersWithLoad]
     B --> C["SMEMBERS &lt;prefix&gt;:members"]
-    C --> D["MGET addresses + resource counts"]
+    C --> D["MGET addresses + instance counts"]
     D --> E{Strategy}
 
     E -->|round-robin| F["Next member in cycle"]
@@ -100,19 +100,19 @@ flowchart TD
 
 Pick one based on workload shape:
 
-- **`round-robin`** (default) -- even distribution, ignores load. Cheapest. Right when resources are roughly uniform in cost.
-- **`least-loaded`** -- reads each pod's resource count from Redis (one `MGET` round-trip), picks the minimum, breaks ties round-robin. Right when resources are heavy and you want to spread them (e.g. connection pools, long-lived simulations).
+- **`round-robin`** (default) -- even distribution, ignores load. Cheapest. Right when instances are roughly uniform in cost.
+- **`least-loaded`** -- reads each pod's instance count from Redis (one `MGET` round-trip), picks the minimum, breaks ties round-robin. Right when instances are heavy and you want to spread them (e.g. connection pools, long-lived simulations).
 - **`random`** -- one `Math.random()`. Right for sharded scenarios where you want zero coordination state.
 
 You can also pass a custom `AllocationStrategy` instance to the `Registry` constructor.
 
 ## Orphan detection
 
-When a pod's address key TTL expires (pod crashed, pod missed heartbeats), its resource mappings still point at the dead `memberId`. The next request for one of those resources surfaces the situation:
+When a pod's address key TTL expires (pod crashed, pod missed heartbeats), its instance mappings still point at the dead `memberId`. The next request for one of those instances surfaces the situation:
 
 ```mermaid
 flowchart TD
-    A[Request for resourceId] --> B{Lookup mapping}
+    A[Request for instanceId] --> B{Lookup mapping}
     B -->|Not found| E[404]
     B -->|memberId exists| C{Member address alive?}
     C -->|Yes| D[Proxy to pod]
@@ -123,7 +123,7 @@ flowchart TD
     I --> J["Pod rehydrates from<br/>shared state on first hit"]
 ```
 
-`reassignOrphans` is opt-in **per call** (per route, in practice). Use `true` only when your pods can rebuild a resource's state from shared storage on demand. Use `false` (the default) when "pod is dead" should mean "resource is gone" -- the helper returns a `{ address: null }` result and the route handler decides what to do.
+`reassignOrphans` is opt-in **per call** (per route, in practice). Use `true` only when your pods can rebuild an instance's state from shared storage on demand. Use `false` (the default) when "pod is dead" should mean "instance is gone" -- the helper returns a `{ address: null }` result and the route handler decides what to do.
 
 ## Sticky helpers
 
@@ -132,27 +132,27 @@ Three Fastify route handlers cover the patterns that repeat across consumers. Ea
 ### `lookupAndProxy`
 
 ```ts
-app.post('/resources/:id/work', lookupAndProxy(registry, {
-  resourceFrom: req => req.params.id,
+app.post('/instances/:id/work', lookupAndProxy(registry, {
+  instanceFrom: req => req.params.id,
   reassignOrphans: true
 }))
 ```
 
-Resolves the resource, proxies the request to the owning pod, drains the response. On unknown resource: 404. On dead pod with `reassignOrphans: false`: also 404. On dead pod with `reassignOrphans: true`: picks a new pod, rewrites the mapping, proxies there.
+Resolves the instance, proxies the request to the owning pod, drains the response. On unknown instance: 404. On dead pod with `reassignOrphans: false`: also 404. On dead pod with `reassignOrphans: true`: picks a new pod, rewrites the mapping, proxies there.
 
-Defaults: `reassignOrphans: false`, `notFoundMessage: 'Resource not found'`.
+Defaults: `reassignOrphans: false`, `notFoundMessage: 'Instance not found'`.
 
 Doesn't handle: streaming, response-header rewrites, custom error envelopes. For those, drop down to `proxyRequest` + `drainAndReply` and write the route inline.
 
 ### `pickAndRegister`
 
 ```ts
-app.post('/resources', pickAndRegister(registry, {
-  registerIdFrom: res => res.resourceId
+app.post('/instances', pickAndRegister(registry, {
+  registerIdFrom: res => res.instanceId
 }))
 ```
 
-Picks a member via the strategy, proxies the create request to it, and registers the resulting id in Redis **only** if the upstream returns `expectedStatus`. The footgun this kills: forgetting to gate `registerResource` on success, which would otherwise bind Redis mappings to resources the pod never created.
+Picks a member via the strategy, proxies the create request to it, and registers the resulting id in Redis **only** if the upstream returns `expectedStatus`. The footgun this kills: forgetting to gate `registerInstance` on success, which would otherwise bind Redis mappings to instances the pod never created.
 
 On no live pods: 503 with the configured message. The upstream's response body is forwarded to the client verbatim.
 
@@ -161,22 +161,22 @@ Defaults: `expectedStatus: 201`, `unavailableMessage: 'No pods available'`.
 ### `lookupAndDeregister`
 
 ```ts
-app.delete('/resources/:id', lookupAndDeregister(registry, {
-  resourceFrom: req => req.params.id
+app.delete('/instances/:id', lookupAndDeregister(registry, {
+  instanceFrom: req => req.params.id
 }))
 ```
 
-Resolves the resource (no orphan reassignment -- a dead resource cannot be deleted). If the pod is alive, proxies the DELETE; on `expectedStatus`, drains and deregisters. If the pod is dead, **skips the proxy entirely** and just removes the Redis mapping. The footgun this kills: forcing a freshly assigned pod to spin a resource up just to delete it.
+Resolves the instance (no orphan reassignment -- a dead instance cannot be deleted). If the pod is alive, proxies the DELETE; on `expectedStatus`, drains and deregisters. If the pod is dead, **skips the proxy entirely** and just removes the Redis mapping. The footgun this kills: forcing a freshly assigned pod to spin an instance up just to delete it.
 
-Defaults: `expectedStatus: 204`, `notFoundMessage: 'Resource not found'`.
+Defaults: `expectedStatus: 204`, `notFoundMessage: 'Instance not found'`.
 
 ### When the helper isn't enough
 
 Helpers cover the simple case. For streaming, header overrides, response-body massaging, or alternative error shapes, use the building blocks directly:
 
 ```ts
-app.post('/resources/:id/stream', async (req, reply) => {
-  const resolved = await registry.resolveResource(req.params.id, { reassignOrphans: true })
+app.post('/instances/:id/stream', async (req, reply) => {
+  const resolved = await registry.resolveInstance(req.params.id, { reassignOrphans: true })
   if (!resolved?.address) return reply.code(404).send({ error: 'Not found' })
   const u = await proxyRequest(resolved.address, req, { timeout: registry.requestTimeout })
   reply.code(u.statusCode)
@@ -226,11 +226,11 @@ Two Prometheus instruments, configurable namespace:
 | `<namespace>_requests_total`          | counter | `route`, `result`  |
 | `<namespace>_pod_count`               | gauge   | -                  |
 
-The `route` label is the Fastify pattern (`/resources/:id/work`), so dashboards keep per-route granularity without per-call configuration. The `result` label is one of:
+The `route` label is the Fastify pattern (`/instances/:id/work`), so dashboards keep per-route granularity without per-call configuration. The `result` label is one of:
 
 - `hit` -- proxied to the live owning pod
 - `orphan_reassigned` -- pod was dead, reassigned
-- `not_found` -- unknown resource
+- `not_found` -- unknown instance
 - `spawned` -- `pickAndRegister` succeeded with `expectedStatus`
 - `unavailable` -- `pickAndRegister` had no live pods
 - `deregistered` -- `lookupAndDeregister` succeeded with the live pod
@@ -283,10 +283,10 @@ async function myCoordinatorPlugin (app) {
   })
 
   // YOUR routes here -- the API contract you're publishing.
-  const id = req => req.params.resourceId
-  app.post('/resources', pickAndRegister(registry, { registerIdFrom: r => r.resourceId }))
-  app.post('/resources/:resourceId/work', lookupAndProxy(registry, { resourceFrom: id, reassignOrphans: true }))
-  app.delete('/resources/:resourceId', lookupAndDeregister(registry, { resourceFrom: id }))
+  const id = req => req.params.instanceId
+  app.post('/instances', pickAndRegister(registry, { registerIdFrom: r => r.instanceId }))
+  app.post('/instances/:instanceId/work', lookupAndProxy(registry, { instanceFrom: id, reassignOrphans: true }))
+  app.delete('/instances/:instanceId', lookupAndDeregister(registry, { instanceFrom: id }))
 }
 
 export const plugin = fp(myCoordinatorPlugin, { name: 'my-coordinator' })

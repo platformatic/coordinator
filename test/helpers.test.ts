@@ -13,7 +13,7 @@ const PREFIX = `test-${randomBytes(4).toString('hex')}`
 
 function membersKey (): string { return `${PREFIX}:members` }
 function memberKey (id: string): string { return `${PREFIX}:member:${id}` }
-function resourceKey (id: string): string { return `${PREFIX}:resource:${id}` }
+function resourceKey (id: string): string { return `${PREFIX}:instance:${id}` }
 
 interface MockPod {
   app: ReturnType<typeof Fastify>
@@ -69,17 +69,17 @@ async function createCoordinator (registry: Registry) {
   app.post('/resources/:id/echo',
     { schema: { body: { type: 'object', properties: { msg: { type: 'string' } } } } },
     lookupAndProxy(registry, {
-      resourceFrom: (req: any) => req.params.id,
+      instanceFrom: (req: any) => req.params.id,
       reassignOrphans: true
     }))
 
   app.post('/resources/:id/heartbeat', lookupAndProxy(registry, {
-    resourceFrom: (req: any) => req.params.id,
+    instanceFrom: (req: any) => req.params.id,
     reassignOrphans: true
   }))
 
   app.delete('/resources/:id', lookupAndDeregister(registry, {
-    resourceFrom: (req: any) => req.params.id
+    instanceFrom: (req: any) => req.params.id
   }))
 
   return app
@@ -163,7 +163,7 @@ test('Coordinator helpers', async (t) => {
     })
     strictEqual(res.statusCode, 404)
     const body = res.json() as any
-    strictEqual(body.error, 'Resource not found')
+    strictEqual(body.error, 'Instance not found')
   })
 
   await t.test('lookupAndProxy: reassigns orphan when reassignOrphans is true', async () => {

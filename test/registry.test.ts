@@ -15,12 +15,12 @@ function memberKey (memberId: string): string {
   return `${PREFIX}:member:${memberId}`
 }
 
-function resourceKey (resourceId: string): string {
-  return `${PREFIX}:resource:${resourceId}`
+function instanceKey (instanceId: string): string {
+  return `${PREFIX}:instance:${instanceId}`
 }
 
 function loadKey (memberId: string): string {
-  return `${PREFIX}:member:${memberId}:resources`
+  return `${PREFIX}:member:${memberId}:instances`
 }
 
 test('Registry', async (t) => {
@@ -74,32 +74,32 @@ test('Registry', async (t) => {
     await sharedRedis.set(memberKey(member2Id), member2Address, 'EX', 30)
   })
 
-  await t.test('lookupResource returns pod address via two-step lookup', async () => {
-    const resourceId = 'res-1'
-    await sharedRedis.set(resourceKey(resourceId), member1Id)
+  await t.test('lookupInstance returns pod address via two-step lookup', async () => {
+    const instanceId = 'inst-1'
+    await sharedRedis.set(instanceKey(instanceId), member1Id)
 
-    const address = await registry.lookupResource(resourceId)
+    const address = await registry.lookupInstance(instanceId)
     strictEqual(address, member1Address)
   })
 
-  await t.test('lookupResource returns null for unknown resource', async () => {
-    const address = await registry.lookupResource('nonexistent')
+  await t.test('lookupInstance returns null for unknown instance', async () => {
+    const address = await registry.lookupInstance('nonexistent')
     strictEqual(address, null)
   })
 
-  await t.test('registerResource sets resource mapping', async () => {
-    const resourceId = 'res-2'
-    await registry.registerResource(resourceId, member2Id)
+  await t.test('registerInstance sets instance mapping', async () => {
+    const instanceId = 'inst-2'
+    await registry.registerInstance(instanceId, member2Id)
 
-    const value = await sharedRedis.get(resourceKey(resourceId))
+    const value = await sharedRedis.get(instanceKey(instanceId))
     strictEqual(value, member2Id)
   })
 
-  await t.test('deregisterResource removes resource mapping', async () => {
-    const resourceId = 'res-2'
-    await registry.deregisterResource(resourceId)
+  await t.test('deregisterInstance removes instance mapping', async () => {
+    const instanceId = 'inst-2'
+    await registry.deregisterInstance(instanceId)
 
-    const value = await sharedRedis.get(resourceKey(resourceId))
+    const value = await sharedRedis.get(instanceKey(instanceId))
     strictEqual(value, null)
   })
 
@@ -111,47 +111,47 @@ test('Registry', async (t) => {
     ok(first.memberId !== second.memberId, 'round-robin should cycle through members')
   })
 
-  await t.test('lookupResourceMemberId returns memberId for registered resource', async () => {
-    const resourceId = 'res-1'
-    const memberId = await registry.lookupResourceMemberId(resourceId)
+  await t.test('lookupInstanceMemberId returns memberId for registered instance', async () => {
+    const instanceId = 'inst-1'
+    const memberId = await registry.lookupInstanceMemberId(instanceId)
     strictEqual(memberId, member1Id)
   })
 
-  await t.test('lookupResourceMemberId returns null for unknown resource', async () => {
-    const memberId = await registry.lookupResourceMemberId('nonexistent')
+  await t.test('lookupInstanceMemberId returns null for unknown instance', async () => {
+    const memberId = await registry.lookupInstanceMemberId('nonexistent')
     strictEqual(memberId, null)
   })
 
-  await t.test('resolveResource returns address for live resource', async () => {
-    const result = await registry.resolveResource('res-1')
+  await t.test('resolveInstance returns address for live instance', async () => {
+    const result = await registry.resolveInstance('inst-1')
     ok(result)
     strictEqual(result.address, member1Address)
     strictEqual(result.reassigned, false)
   })
 
-  await t.test('resolveResource returns null for completely unknown resource', async () => {
-    const result = await registry.resolveResource('nonexistent')
+  await t.test('resolveInstance returns null for completely unknown instance', async () => {
+    const result = await registry.resolveInstance('nonexistent')
     strictEqual(result, null)
   })
 
-  await t.test('resolveResource returns address: null when pod is dead and reassignOrphans is false', async () => {
-    const orphanId = 'res-orphan-no-reassign'
+  await t.test('resolveInstance returns address: null when pod is dead and reassignOrphans is false', async () => {
+    const orphanId = 'inst-orphan-no-reassign'
     const deadMemberId = 'dead-pod'
-    await sharedRedis.set(resourceKey(orphanId), deadMemberId)
+    await sharedRedis.set(instanceKey(orphanId), deadMemberId)
 
-    const result = await registry.resolveResource(orphanId)
+    const result = await registry.resolveInstance(orphanId)
     ok(result)
     strictEqual(result.address, null)
     strictEqual(result.reassigned, false)
 
     // Mapping must still exist
-    const mapping = await sharedRedis.get(resourceKey(orphanId))
+    const mapping = await sharedRedis.get(instanceKey(orphanId))
     strictEqual(mapping, deadMemberId)
 
-    await sharedRedis.del(resourceKey(orphanId))
+    await sharedRedis.del(instanceKey(orphanId))
   })
 
-  await t.test('listMembersWithLoad returns resource counts', async () => {
+  await t.test('listMembersWithLoad returns instance counts', async () => {
     await sharedRedis.set(loadKey(member1Id), '3', 'EX', 30)
     await sharedRedis.set(loadKey(member2Id), '7', 'EX', 30)
 
@@ -160,11 +160,11 @@ test('Registry', async (t) => {
 
     const m1 = members.find(m => m.memberId === member1Id)
     ok(m1)
-    strictEqual(m1.resourceCount, 3)
+    strictEqual(m1.instanceCount, 3)
 
     const m2 = members.find(m => m.memberId === member2Id)
     ok(m2)
-    strictEqual(m2.resourceCount, 7)
+    strictEqual(m2.instanceCount, 7)
 
     await sharedRedis.del(loadKey(member1Id), loadKey(member2Id))
   })
@@ -172,41 +172,41 @@ test('Registry', async (t) => {
   await t.test('listMembersWithLoad defaults to 0 for missing count keys', async () => {
     const members = await registry.listMembersWithLoad()
     for (const member of members) {
-      strictEqual(member.resourceCount, 0)
+      strictEqual(member.instanceCount, 0)
     }
   })
 
-  await t.test('resolveResource detects orphan and reassigns when reassignOrphans is true', async () => {
-    const orphanId = 'res-orphan-reassign'
+  await t.test('resolveInstance detects orphan and reassigns when reassignOrphans is true', async () => {
+    const orphanId = 'inst-orphan-reassign'
     const deadMemberId = 'dead-pod'
 
-    await sharedRedis.set(resourceKey(orphanId), deadMemberId)
+    await sharedRedis.set(instanceKey(orphanId), deadMemberId)
 
-    const result = await registry.resolveResource(orphanId, { reassignOrphans: true })
+    const result = await registry.resolveInstance(orphanId, { reassignOrphans: true })
     ok(result)
     strictEqual(result.reassigned, true)
     ok(result.address === member1Address || result.address === member2Address)
 
-    const newMemberId = await sharedRedis.get(resourceKey(orphanId))
+    const newMemberId = await sharedRedis.get(instanceKey(orphanId))
     ok(newMemberId === member1Id || newMemberId === member2Id)
 
-    await sharedRedis.del(resourceKey(orphanId))
+    await sharedRedis.del(instanceKey(orphanId))
   })
 
-  await t.test('resolveResource returns address: null when reassignOrphans is true but no live pods', async () => {
-    const orphanId = 'res-orphan-no-pods'
+  await t.test('resolveInstance returns address: null when reassignOrphans is true but no live pods', async () => {
+    const orphanId = 'inst-orphan-no-pods'
     const deadMemberId = 'dead-pod'
 
     // Temporarily remove all live pods
     await sharedRedis.del(memberKey(member1Id), memberKey(member2Id))
-    await sharedRedis.set(resourceKey(orphanId), deadMemberId)
+    await sharedRedis.set(instanceKey(orphanId), deadMemberId)
 
-    const result = await registry.resolveResource(orphanId, { reassignOrphans: true })
+    const result = await registry.resolveInstance(orphanId, { reassignOrphans: true })
     ok(result)
     strictEqual(result.address, null)
     strictEqual(result.reassigned, false)
 
-    await sharedRedis.del(resourceKey(orphanId))
+    await sharedRedis.del(instanceKey(orphanId))
     await sharedRedis.set(memberKey(member1Id), member1Address, 'EX', 30)
     await sharedRedis.set(memberKey(member2Id), member2Address, 'EX', 30)
   })

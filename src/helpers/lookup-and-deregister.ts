@@ -4,7 +4,7 @@ import { drainAndReply } from '../drain-and-reply.ts'
 import type { Registry } from '../registry.ts'
 
 export interface LookupAndDeregisterOptions {
-  resourceFrom: (req: FastifyRequest) => string
+  instanceFrom: (req: FastifyRequest) => string
   expectedStatus?: number
   notFoundMessage?: string
 }
@@ -14,15 +14,15 @@ export function lookupAndDeregister (
   opts: LookupAndDeregisterOptions
 ): RouteHandlerMethod {
   const {
-    resourceFrom,
+    instanceFrom,
     expectedStatus = 204,
-    notFoundMessage = 'Resource not found'
+    notFoundMessage = 'Instance not found'
   } = opts
 
   return async function (request: FastifyRequest, reply: FastifyReply) {
-    const resourceId = resourceFrom(request)
+    const instanceId = instanceFrom(request)
     const route = request.routeOptions?.url ?? request.url
-    const resolved = await registry.resolveResource(resourceId)
+    const resolved = await registry.resolveInstance(instanceId)
 
     if (!resolved) {
       registry.metrics?.requestsTotal.inc({ route, result: 'not_found' })
@@ -30,7 +30,7 @@ export function lookupAndDeregister (
     }
 
     if (resolved.address === null) {
-      await registry.deregisterResource(resourceId)
+      await registry.deregisterInstance(instanceId)
       registry.metrics?.requestsTotal.inc({ route, result: 'deregistered_dead_pod' })
       return reply.code(expectedStatus).send()
     }
@@ -39,7 +39,7 @@ export function lookupAndDeregister (
 
     if (upstream.statusCode === expectedStatus) {
       await upstream.body.dump()
-      await registry.deregisterResource(resourceId)
+      await registry.deregisterInstance(instanceId)
       registry.metrics?.requestsTotal.inc({ route, result: 'deregistered' })
       return reply.code(expectedStatus).send()
     }

@@ -1,7 +1,7 @@
 export interface MemberWithLoad {
   memberId: string
   address: string
-  resourceCount: number
+  instanceCount: number
 }
 
 export interface AllocationStrategy {
@@ -24,8 +24,8 @@ export class LeastLoadedStrategy implements AllocationStrategy {
 
   pick (members: MemberWithLoad[]): MemberWithLoad | null {
     if (members.length === 0) return null
-    const minCount = Math.min(...members.map(m => m.resourceCount))
-    const candidates = members.filter(m => m.resourceCount === minCount)
+    const minCount = Math.min(...members.map(m => m.instanceCount))
+    const candidates = members.filter(m => m.instanceCount === minCount)
     const member = candidates[this.#tieBreaker % candidates.length]
     this.#tieBreaker = (this.#tieBreaker + 1) % candidates.length
     return member

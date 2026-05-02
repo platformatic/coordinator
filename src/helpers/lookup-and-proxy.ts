@@ -4,7 +4,7 @@ import { drainAndReply } from '../drain-and-reply.ts'
 import type { Registry } from '../registry.ts'
 
 export interface LookupAndProxyOptions {
-  resourceFrom: (req: FastifyRequest) => string
+  instanceFrom: (req: FastifyRequest) => string
   reassignOrphans?: boolean
   notFoundMessage?: string
 }
@@ -14,15 +14,15 @@ export function lookupAndProxy (
   opts: LookupAndProxyOptions
 ): RouteHandlerMethod {
   const {
-    resourceFrom,
+    instanceFrom,
     reassignOrphans = false,
-    notFoundMessage = 'Resource not found'
+    notFoundMessage = 'Instance not found'
   } = opts
 
   return async function (request: FastifyRequest, reply: FastifyReply) {
-    const resourceId = resourceFrom(request)
+    const instanceId = instanceFrom(request)
     const route = request.routeOptions?.url ?? request.url
-    const resolved = await registry.resolveResource(resourceId, { reassignOrphans })
+    const resolved = await registry.resolveInstance(instanceId, { reassignOrphans })
 
     if (!resolved || resolved.address === null) {
       registry.metrics?.requestsTotal.inc({ route, result: 'not_found' })

@@ -50,12 +50,12 @@ export class Registry {
     return `${this.#keyPrefix}:member:${memberId}`
   }
 
-  #resourceKey (resourceId: string): string {
-    return `${this.#keyPrefix}:resource:${resourceId}`
+  #instanceKey (instanceId: string): string {
+    return `${this.#keyPrefix}:instance:${instanceId}`
   }
 
   #memberLoadKey (memberId: string): string {
-    return `${this.#keyPrefix}:member:${memberId}:resources`
+    return `${this.#keyPrefix}:member:${memberId}:instances`
   }
 
   async listMembers (): Promise<MemberInfo[]> {
@@ -79,7 +79,7 @@ export class Registry {
 
     return members.map((member, i) => ({
       ...member,
-      resourceCount: parseInt(counts[i] ?? '0', 10) || 0
+      instanceCount: parseInt(counts[i] ?? '0', 10) || 0
     }))
   }
 
@@ -88,21 +88,21 @@ export class Registry {
     return this.#strategy.pick(members)
   }
 
-  async lookupResource (resourceId: string): Promise<string | null> {
-    const memberId = await this.#redis.get(this.#resourceKey(resourceId))
+  async lookupInstance (instanceId: string): Promise<string | null> {
+    const memberId = await this.#redis.get(this.#instanceKey(instanceId))
     if (!memberId) return null
     return this.#redis.get(this.#memberKey(memberId))
   }
 
-  async lookupResourceMemberId (resourceId: string): Promise<string | null> {
-    return this.#redis.get(this.#resourceKey(resourceId))
+  async lookupInstanceMemberId (instanceId: string): Promise<string | null> {
+    return this.#redis.get(this.#instanceKey(instanceId))
   }
 
-  async resolveResource (
-    resourceId: string,
+  async resolveInstance (
+    instanceId: string,
     opts: { reassignOrphans?: boolean } = {}
   ): Promise<ResolveResult | null> {
-    const memberId = await this.#redis.get(this.#resourceKey(resourceId))
+    const memberId = await this.#redis.get(this.#instanceKey(instanceId))
     if (!memberId) return null
 
     const address = await this.#redis.get(this.#memberKey(memberId))
@@ -115,16 +115,16 @@ export class Registry {
     const newPod = await this.pickMember()
     if (!newPod) return { address: null, reassigned: false }
 
-    await this.registerResource(resourceId, newPod.memberId)
+    await this.registerInstance(instanceId, newPod.memberId)
     return { address: newPod.address, reassigned: true }
   }
 
-  async registerResource (resourceId: string, memberId: string): Promise<void> {
-    await this.#redis.set(this.#resourceKey(resourceId), memberId)
+  async registerInstance (instanceId: string, memberId: string): Promise<void> {
+    await this.#redis.set(this.#instanceKey(instanceId), memberId)
   }
 
-  async deregisterResource (resourceId: string): Promise<void> {
-    await this.#redis.del(this.#resourceKey(resourceId))
+  async deregisterInstance (instanceId: string): Promise<void> {
+    await this.#redis.del(this.#instanceKey(instanceId))
   }
 
   async close (): Promise<void> {

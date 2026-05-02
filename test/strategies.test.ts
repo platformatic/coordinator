@@ -4,9 +4,9 @@ import { RoundRobinStrategy, LeastLoadedStrategy, RandomStrategy, createStrategy
 import type { MemberWithLoad } from '../src/strategies.ts'
 
 const members: MemberWithLoad[] = [
-  { memberId: 'pod-1', address: 'http://localhost:3001', resourceCount: 5 },
-  { memberId: 'pod-2', address: 'http://localhost:3002', resourceCount: 2 },
-  { memberId: 'pod-3', address: 'http://localhost:3003', resourceCount: 8 }
+  { memberId: 'pod-1', address: 'http://localhost:3001', instanceCount: 5 },
+  { memberId: 'pod-2', address: 'http://localhost:3002', instanceCount: 2 },
+  { memberId: 'pod-3', address: 'http://localhost:3003', instanceCount: 8 }
 ]
 
 test('RoundRobinStrategy - cycles through members', () => {
@@ -32,20 +32,20 @@ test('RoundRobinStrategy - returns null for empty list', () => {
   strictEqual(strategy.pick([]), null)
 })
 
-test('LeastLoadedStrategy - picks member with fewest resources', () => {
+test('LeastLoadedStrategy - picks member with fewest instances', () => {
   const strategy = new LeastLoadedStrategy()
   const picked = strategy.pick(members)
   ok(picked)
   strictEqual(picked.memberId, 'pod-2')
-  strictEqual(picked.resourceCount, 2)
+  strictEqual(picked.instanceCount, 2)
 })
 
 test('LeastLoadedStrategy - breaks ties with round-robin', () => {
   const strategy = new LeastLoadedStrategy()
   const tiedMembers: MemberWithLoad[] = [
-    { memberId: 'pod-a', address: 'http://a', resourceCount: 3 },
-    { memberId: 'pod-b', address: 'http://b', resourceCount: 3 },
-    { memberId: 'pod-c', address: 'http://c', resourceCount: 5 }
+    { memberId: 'pod-a', address: 'http://a', instanceCount: 3 },
+    { memberId: 'pod-b', address: 'http://b', instanceCount: 3 },
+    { memberId: 'pod-c', address: 'http://c', instanceCount: 5 }
   ]
 
   const first = strategy.pick(tiedMembers)
