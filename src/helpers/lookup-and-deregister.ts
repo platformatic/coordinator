@@ -3,10 +3,17 @@ import { proxyRequest } from '../proxy-request.ts'
 import { drainAndReply } from '../drain-and-reply.ts'
 import type { Registry } from '../registry.ts'
 
+export type LookupAndDeregisterResult =
+  | 'deregistered'
+  | 'deregistered_dead_pod'
+  | 'not_found'
+  | 'upstream_error'
+
 export interface LookupAndDeregisterOptions {
   instanceFrom: (req: FastifyRequest) => string
   expectedStatus?: number
   notFoundMessage?: string
+  onResult?: (result: LookupAndDeregisterResult) => void
 }
 
 export function lookupAndDeregister (
@@ -16,22 +23,22 @@ export function lookupAndDeregister (
   const {
     instanceFrom,
     expectedStatus = 204,
-    notFoundMessage = 'Instance not found'
+    notFoundMessage = 'Instance not found',
+    onResult
   } = opts
 
   return async function (request: FastifyRequest, reply: FastifyReply) {
     const instanceId = instanceFrom(request)
-    const route = request.routeOptions?.url ?? request.url
     const resolved = await registry.resolveInstance(instanceId)
 
     if (!resolved) {
-      registry.metrics?.requestsTotal.inc({ route, result: 'not_found' })
+      onResult?.('not_found')
       return reply.code(404).send({ error: notFoundMessage })
     }
 
     if (resolved.address === null) {
       await registry.deregisterInstance(instanceId)
-      registry.metrics?.requestsTotal.inc({ route, result: 'deregistered_dead_pod' })
+      onResult?.('deregistered_dead_pod')
       return reply.code(expectedStatus).send()
     }
 
@@ -40,11 +47,11 @@ export function lookupAndDeregister (
     if (upstream.statusCode === expectedStatus) {
       await upstream.body.dump()
       await registry.deregisterInstance(instanceId)
-      registry.metrics?.requestsTotal.inc({ route, result: 'deregistered' })
+      onResult?.('deregistered')
       return reply.code(expectedStatus).send()
     }
 
-    registry.metrics?.requestsTotal.inc({ route, result: 'upstream_error' })
+    onResult?.('upstream_error')
     return drainAndReply(reply, upstream)
   }
 }

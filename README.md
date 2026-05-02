@@ -127,7 +127,7 @@ flowchart TD
 
 ## Sticky helpers
 
-Three Fastify route handlers cover the patterns that repeat across consumers. Each is a one-liner at the call site, captures one specific footgun, and bumps metrics consistently.
+Three Fastify route handlers cover the patterns that repeat across consumers. Each is a one-liner at the call site and captures one specific footgun. Helpers do not touch metrics directly -- they emit a tagged result via an optional `onResult` callback, which the preset can hook into to bump its own counters with whatever label scheme it likes.
 
 ### `lookupAndProxy`
 
@@ -140,7 +140,7 @@ app.post('/instances/:id/work', lookupAndProxy(registry, {
 
 Resolves the instance, proxies the request to the owning pod, drains the response. On unknown instance: 404. On dead pod with `reassignOrphans: false`: also 404. On dead pod with `reassignOrphans: true`: picks a new pod, rewrites the mapping, proxies there.
 
-Defaults: `reassignOrphans: false`, `notFoundMessage: 'Instance not found'`.
+Defaults: `reassignOrphans: false`, `notFoundMessage: 'Instance not found'`. Optional `onResult: (r) => void` is called with `'hit' | 'orphan_reassigned' | 'not_found'`.
 
 Doesn't handle: streaming, response-header rewrites, custom error envelopes. For those, drop down to `proxyRequest` + `drainAndReply` and write the route inline.
 
@@ -156,7 +156,7 @@ Picks a member via the strategy, proxies the create request to it, and registers
 
 On no live pods: 503 with the configured message. The upstream's response body is forwarded to the client verbatim.
 
-Defaults: `expectedStatus: 201`, `unavailableMessage: 'No pods available'`.
+Defaults: `expectedStatus: 201`, `unavailableMessage: 'No pods available'`. Optional `onResult: (r) => void` is called with `'spawned' | 'unavailable' | 'upstream_error'`.
 
 ### `lookupAndDeregister`
 
@@ -168,7 +168,7 @@ app.delete('/instances/:id', lookupAndDeregister(registry, {
 
 Resolves the instance (no orphan reassignment -- a dead instance cannot be deleted). If the pod is alive, proxies the DELETE; on `expectedStatus`, drains and deregisters. If the pod is dead, **skips the proxy entirely** and just removes the Redis mapping. The footgun this kills: forcing a freshly assigned pod to spin an instance up just to delete it.
 
-Defaults: `expectedStatus: 204`, `notFoundMessage: 'Instance not found'`.
+Defaults: `expectedStatus: 204`, `notFoundMessage: 'Instance not found'`. Optional `onResult: (r) => void` is called with `'deregistered' | 'deregistered_dead_pod' | 'not_found' | 'upstream_error'`.
 
 ### When the helper isn't enough
 
@@ -205,41 +205,36 @@ Wraps undici with the bits that are easy to forget:
 
 ## Metrics
 
-Signature: `createCoordinatorMetrics(prometheus?, opts?)`. The first argument is a Prometheus client; pass nothing to auto-detect from `globalThis.platformatic.prometheus` (the source Watt populates).
+The library does not ship a metrics module. Each preset is responsible for its own counters and gauges -- the label scheme that makes sense for one preset (e.g. Regina's `type` label with values like `chat`, `chat_stream`, `messages`) won't fit another. A typical preset reads `globalThis.platformatic?.prometheus` inside its Fastify plugin, builds the counters/gauges it needs, and feeds them into the helpers via `onResult`:
 
 ```ts
-import { createCoordinatorMetrics, Registry } from '@platformatic/coordinator'
+const prom = (globalThis as any).platformatic?.prometheus
+const requestsTotal = prom && new prom.client.Counter({
+  name: 'my_coordinator_requests_total',
+  help: 'Routed requests',
+  labelNames: ['type', 'result'],
+  registers: [prom.registry]
+})
 
-// Auto-detect (typical inside a Watt stackable):
-const metrics = createCoordinatorMetrics(undefined, { namespace: 'myservice_coordinator' })
-
-// Or pass an explicit client:
-// const metrics = createCoordinatorMetrics({ client: promClient, registry: promRegistry }, { namespace: 'myservice_coordinator' })
-
-const registry = new Registry({ redis, keyPrefix: 'myservice', metrics: metrics ?? undefined })
+app.post('/things/:id/work', lookupAndProxy(registry, {
+  instanceFrom: req => req.params.id,
+  reassignOrphans: true,
+  onResult: (result) => requestsTotal?.inc({ type: 'work', result })
+}))
 ```
 
-Two Prometheus instruments, configurable namespace:
+A common gauge is `<preset>_pod_count`. Refresh it on a `setInterval`:
 
-| Metric                                | Type    | Labels             |
-|---------------------------------------|---------|--------------------|
-| `<namespace>_requests_total`          | counter | `route`, `result`  |
-| `<namespace>_pod_count`               | gauge   | -                  |
-
-The `route` label is the Fastify pattern (`/instances/:id/work`), so dashboards keep per-route granularity without per-call configuration. The `result` label is one of:
-
-- `hit` -- proxied to the live owning pod
-- `orphan_reassigned` -- pod was dead, reassigned
-- `not_found` -- unknown instance
-- `spawned` -- `pickAndRegister` succeeded with `expectedStatus`
-- `unavailable` -- `pickAndRegister` had no live pods
-- `deregistered` -- `lookupAndDeregister` succeeded with the live pod
-- `deregistered_dead_pod` -- `lookupAndDeregister` skipped the dead pod
-- `upstream_error` -- non-expected status from the upstream
-
-`createCoordinatorMetrics` returns `null` if no Prometheus client is reachable (`globalThis.platformatic.prometheus` is the default source); helpers no-op their metric calls when the Registry has no metrics object.
-
-The pod-count gauge is **not** auto-refreshed. Each preset is responsible for periodically calling `registry.listMembers()` and writing `metrics.podCount.set(members.length)` -- typically a 15s `setInterval` in the Fastify plugin.
+```ts
+const podCount = prom && new prom.client.Gauge({
+  name: 'my_coordinator_pod_count', help: 'Registered pod count', registers: [prom.registry]
+})
+const refresh = async () => podCount?.set((await registry.listMembers()).length)
+const interval = setInterval(refresh, 15_000)
+interval.unref()
+refresh()
+app.addHook('onClose', () => clearInterval(interval))
+```
 
 ## Writing a preset
 
@@ -249,38 +244,23 @@ A preset is the smallest possible Watt stackable that exposes its API contract u
 import fp from 'fastify-plugin'
 import {
   Registry, proxyRequest, drainAndReply,
-  lookupAndProxy, pickAndRegister, lookupAndDeregister,
-  createCoordinatorMetrics
+  lookupAndProxy, pickAndRegister, lookupAndDeregister
 } from '@platformatic/coordinator'
 
 async function myCoordinatorPlugin (app) {
   // Watt augments the Fastify instance with `.platformatic`; cast in TS.
   const config = (app as any).platformatic.config.myCoordinator ?? {}
-  const metrics = createCoordinatorMetrics(undefined, { namespace: 'my_coordinator' })
 
   const registry = new Registry({
-    redis: config.redis,                                       // string from watt.json
-    keyPrefix: 'myservice',                                    // YOUR namespace
+    redis: config.redis,                                  // string from watt.json
+    keyPrefix: 'myservice',                               // YOUR namespace
     strategy: config.allocationStrategy ?? 'least-loaded',
-    requestTimeout: config.requestTimeout,
-    metrics: metrics ?? undefined
+    requestTimeout: config.requestTimeout
   })
 
-  let podCountInterval
-  if (metrics) {
-    const refresh = async () => {
-      const members = await registry.listMembers()
-      metrics.podCount.set(members.length)
-    }
-    refresh()
-    podCountInterval = setInterval(refresh, 15_000)
-    podCountInterval.unref()
-  }
+  app.addHook('onClose', () => registry.close())
 
-  app.addHook('onClose', async () => {
-    if (podCountInterval) clearInterval(podCountInterval)
-    await registry.close()
-  })
+  // (Optional) Wire your own metrics here. See the Metrics section.
 
   // YOUR routes here -- the API contract you're publishing.
   const id = req => req.params.instanceId
@@ -301,15 +281,15 @@ export {
   Registry,
   RoundRobinStrategy, LeastLoadedStrategy, RandomStrategy, createStrategy,
   proxyRequest, drainAndReply,
-  lookupAndProxy, pickAndRegister, lookupAndDeregister,
-  createCoordinatorMetrics
+  lookupAndProxy, pickAndRegister, lookupAndDeregister
 }
 
 export type {
   AllocationStrategy, MemberInfo, MemberWithLoad, ResolveResult,
   RegistryOptions, ProxyRequestOptions,
-  CoordinatorMetrics, CreateMetricsOptions,
-  LookupAndProxyOptions, PickAndRegisterOptions, LookupAndDeregisterOptions
+  LookupAndProxyOptions, LookupAndProxyResult,
+  PickAndRegisterOptions, PickAndRegisterResult,
+  LookupAndDeregisterOptions, LookupAndDeregisterResult
 }
 ```
 

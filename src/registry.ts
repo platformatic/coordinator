@@ -1,6 +1,5 @@
 import { Redis } from 'iovalkey'
 import { createStrategy, type AllocationStrategy, type MemberWithLoad } from './strategies.ts'
-import type { CoordinatorMetrics } from './metrics.ts'
 
 export interface MemberInfo {
   memberId: string
@@ -12,7 +11,6 @@ export interface RegistryOptions {
   keyPrefix?: string
   strategy?: 'round-robin' | 'least-loaded' | 'random' | AllocationStrategy
   requestTimeout?: number
-  metrics?: CoordinatorMetrics
 }
 
 export interface ResolveResult {
@@ -26,7 +24,6 @@ export class Registry {
   #strategy: AllocationStrategy
 
   readonly requestTimeout: number | undefined
-  readonly metrics: CoordinatorMetrics | undefined
 
   constructor (opts: RegistryOptions) {
     this.#redis = new Redis(opts.redis)
@@ -39,7 +36,6 @@ export class Registry {
     }
 
     this.requestTimeout = opts.requestTimeout
-    this.metrics = opts.metrics
   }
 
   #membersKey (): string {
