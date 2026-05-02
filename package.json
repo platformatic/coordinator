@@ -1,0 +1,47 @@
+{
+  "name": "@platformatic/coordinator",
+  "version": "0.1.0",
+  "description": "Sticky-resource coordinator: Redis-backed registry, allocation strategies, and Fastify route helpers for multi-pod services",
+  "homepage": "https://github.com/platformatic/coordinator",
+  "author": "Platformatic Inc. <oss@platformatic.dev> (https://platformatic.dev)",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/platformatic/coordinator.git"
+  },
+  "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "test": "node --experimental-strip-types --test --test-reporter=cleaner-spec-reporter test/*.test.ts",
+    "test:redis:up": "docker compose up -d --wait",
+    "test:redis:down": "docker compose down -v",
+    "lint": "eslint --cache"
+  },
+  "dependencies": {
+    "iovalkey": "^0.3.3",
+    "undici": "^7.23.0"
+  },
+  "peerDependencies": {
+    "fastify": ">=5.0.0"
+  },
+  "devDependencies": {
+    "cleaner-spec-reporter": "^1.0.3",
+    "eslint": "^9.39.4",
+    "fastify": "^5.3.2",
+    "neostandard": "^0.13.0"
+  },
+  "engines": {
+    "node": ">= 22.18.0"
+  }
+}
