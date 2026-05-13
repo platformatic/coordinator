@@ -59,4 +59,4 @@ jobs:
           git tag "v$VERSION"
           git push origin HEAD:${{ github.ref }} --tags
       - name: Publish to npm
-        run: pnpm publish --no-git-checks --access restricted --provenance
+        run: pnpm publish --no-git-checks --access restricted
