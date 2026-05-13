@@ -1,6 +1,9 @@
 export { Registry } from './registry.ts'
 export type { RegistryOptions, MemberInfo, ResolveResult } from './registry.ts'
 
+export { Member } from './member.ts'
+export type { MemberOptions } from './member.ts'
+
 export {
   RoundRobinStrategy,
   LeastLoadedStrategy,
@@ -11,8 +14,6 @@ export type { AllocationStrategy, MemberWithLoad } from './strategies.ts'
 
 export { proxyRequest } from './proxy-request.ts'
 export type { ProxyRequestOptions } from './proxy-request.ts'
-
-export { drainAndReply } from './drain-and-reply.ts'
 
 export { lookupAndProxy } from './helpers/lookup-and-proxy.ts'
 export type { LookupAndProxyOptions, LookupAndProxyResult } from './helpers/lookup-and-proxy.ts'

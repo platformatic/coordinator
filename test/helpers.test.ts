@@ -2,6 +2,7 @@ import { strictEqual, ok } from 'node:assert'
 import { randomBytes } from 'node:crypto'
 import test from 'node:test'
 import Fastify from 'fastify'
+import replyFrom from '@fastify/reply-from'
 import { Redis } from 'iovalkey'
 import { Registry } from '../src/registry.ts'
 import { lookupAndProxy } from '../src/helpers/lookup-and-proxy.ts'
@@ -61,6 +62,7 @@ async function createMockPod (): Promise<MockPod> {
 
 async function createCoordinator (registry: Registry) {
   const app = Fastify()
+  await app.register(replyFrom)
 
   app.post('/resources', pickAndRegister(registry, {
     registerIdFrom: (res: any) => res.resourceId
@@ -127,6 +129,7 @@ test('Coordinator helpers', async (t) => {
     const isolatedPrefix = `${PREFIX}-empty-${randomBytes(2).toString('hex')}`
     const emptyRegistry = new Registry({ redis: REDIS_URL, keyPrefix: isolatedPrefix })
     const app = Fastify()
+    await app.register(replyFrom)
     app.post('/spawn', pickAndRegister(emptyRegistry, { registerIdFrom: (r: any) => r.id }))
 
     try {

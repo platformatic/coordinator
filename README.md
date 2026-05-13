@@ -39,10 +39,10 @@ Per request: two Redis reads (instance mapping, then member address) plus one up
 ## Install
 
 ```sh
-npm install @platformatic/coordinator
+npm install @platformatic/coordinator @fastify/reply-from
 ```
 
-Peer dependency: `fastify >= 5`. Runtime dependencies: `iovalkey`, `undici`.
+Peer dependencies: `fastify >= 5` and `@fastify/reply-from >= 12`. The helpers proxy upstream responses through `reply.from`, so the host application **must** register `@fastify/reply-from` once before any helper-backed route is mounted. Runtime dependencies: `iovalkey`, `undici`.
 
 ## Redis layout
 
@@ -59,26 +59,41 @@ The coordinator only writes the `:instance:` keys. Everything under `:members` a
 
 ## Pod responsibilities
 
-A pod that wants to participate in a coordinator-managed mesh must:
+A pod that wants to participate in a coordinator-managed mesh uses the `Member` class, which encapsulates every Redis operation the pod side needs:
 
-1. **Register on startup**:
-   ```
-   SADD <prefix>:members <memberId>
-   SET  <prefix>:member:<memberId> <address> EX 30
-   ```
-2. **Heartbeat every ~10s** to refresh the TTL on `<prefix>:member:<memberId>`. Skipping this is what marks the pod dead.
-3. **(Optional) Track load** for the `least-loaded` strategy:
-   ```
-   INCR <prefix>:member:<memberId>:instances   # on instance create
-   DECR <prefix>:member:<memberId>:instances   # on instance close
-   ```
-4. **Deregister on graceful shutdown**:
-   ```
-   SREM <prefix>:members <memberId>
-   DEL  <prefix>:member:<memberId>
-   ```
+```ts
+import { Member } from '@platformatic/coordinator'
 
-The library does not provide pod-side helpers -- pods are typically a different process with its own framework. The contract is just the four operations above.
+const member = new Member({
+  redis: 'redis://valkey:6379',
+  memberId: 'pod-1',
+  address: 'http://pod-1.local:3000',
+  keyPrefix: 'myservice',  // must match the coordinator's keyPrefix
+  ttl: 30                  // optional, seconds; default 30
+})
+
+await member.register()                                // on startup
+const heartbeat = setInterval(() => member.heartbeat(), 10_000)  // every ~10s
+heartbeat.unref()
+
+// when an instance is created/destroyed on this pod:
+await member.registerInstance(instanceId)
+await member.deregisterInstance(instanceId)
+
+// on graceful shutdown:
+clearInterval(heartbeat)
+await member.deregister()
+await member.close()
+```
+
+Under the hood `Member` performs the four Redis operations every coordinator-managed mesh requires:
+
+1. **Register** -- `SADD <prefix>:members <memberId>` and `SET <prefix>:member:<memberId> <address> EX <ttl>`.
+2. **Heartbeat** -- `EXPIRE` on the address key. Skipping this is what marks the pod dead.
+3. **Track load** -- `INCR` / `DECR` on `<prefix>:member:<memberId>:instances` (used by `least-loaded`).
+4. **Deregister** -- `SREM` from the members set, `DEL` the address and load keys.
+
+`Member` owns its own Redis connection and never exposes it; pods don't need to depend on `iovalkey` directly.
 
 ## Allocation strategies
 
@@ -142,7 +157,7 @@ Resolves the instance, proxies the request to the owning pod, drains the respons
 
 Defaults: `reassignOrphans: false`, `notFoundMessage: 'Instance not found'`. Optional `onResult: (r) => void` is called with `'hit' | 'orphan_reassigned' | 'not_found'`.
 
-Doesn't handle: streaming, response-header rewrites, custom error envelopes. For those, drop down to `proxyRequest` + `drainAndReply` and write the route inline.
+Doesn't handle: response-header rewrites, custom error envelopes. For those, resolve the instance yourself and call `reply.from(...)` inline (see "When the helper isn't enough" below).
 
 ### `pickAndRegister`
 
@@ -172,17 +187,21 @@ Defaults: `expectedStatus: 204`, `notFoundMessage: 'Instance not found'`. Option
 
 ### When the helper isn't enough
 
-Helpers cover the simple case. For streaming, header overrides, response-body massaging, or alternative error shapes, use the building blocks directly:
+Helpers cover the simple case. For header overrides, response-body massaging, or alternative error shapes, resolve the instance yourself and forward with `reply.from`:
 
 ```ts
 app.post('/instances/:id/stream', async (req, reply) => {
   const resolved = await registry.resolveInstance(req.params.id, { reassignOrphans: true })
   if (!resolved?.address) return reply.code(404).send({ error: 'Not found' })
-  const u = await proxyRequest(resolved.address, req, { timeout: registry.requestTimeout })
-  reply.code(u.statusCode)
-  if (u.statusCode >= 400) return u.body.json()
-  reply.header('content-type', 'application/x-ndjson')
-  return reply.send(u.body)  // pipes the upstream readable through Fastify
+
+  return reply.from(`${resolved.address}${req.url}`, {
+    rewriteHeaders: (headers) => {
+      if ((headers['content-type'] as string | undefined)?.includes('text/event-stream')) {
+        headers['content-type'] = 'application/x-ndjson'
+      }
+      return headers
+    }
+  })
 })
 ```
 
@@ -190,18 +209,12 @@ app.post('/instances/:id/stream', async (req, reply) => {
 
 ### `proxyRequest(address, req, opts?)`
 
-Wraps undici with the bits that are easy to forget:
+A small undici wrapper used for fan-out routes (where you want to call several pods in parallel and aggregate). The sticky helpers do **not** use this -- they go through `@fastify/reply-from`. Reach for `proxyRequest` only when you genuinely need the raw upstream response object (status code, body parser) outside the request/reply pipeline.
 
 - Pulls `req.method` and `req.url` from Fastify (or uses `opts.upstreamPath`).
 - If `req.body` is set, JSON-stringifies it and sets `content-type: application/json`. JSON-only in v1; non-JSON requires `fastify-raw-body` and is out of scope.
 - Applies `opts.timeout` as both `headersTimeout` and `bodyTimeout` on the undici call.
 - Inbound headers are not propagated.
-
-### `drainAndReply(reply, upstream)`
-
-- Sets `reply.code(upstream.statusCode)`.
-- On 204, drains the upstream body (`body.dump()`) and replies empty -- skipping this leaks sockets.
-- Otherwise returns `body.json()`.
 
 ## Metrics
 
@@ -242,14 +255,18 @@ A preset is the smallest possible Watt stackable that exposes its API contract u
 
 ```ts
 import fp from 'fastify-plugin'
+import replyFrom from '@fastify/reply-from'
 import {
-  Registry, proxyRequest, drainAndReply,
+  Registry,
   lookupAndProxy, pickAndRegister, lookupAndDeregister
 } from '@platformatic/coordinator'
 
 async function myCoordinatorPlugin (app) {
   // Watt augments the Fastify instance with `.platformatic`; cast in TS.
   const config = (app as any).platformatic.config.myCoordinator ?? {}
+
+  // Required: the helpers proxy via reply.from, so register the plugin once.
+  await app.register(replyFrom)
 
   const registry = new Registry({
     redis: config.redis,                                  // string from watt.json
@@ -279,14 +296,15 @@ The preset also owns its `schema` (with `$id` for Watt validation) and its `Gene
 ```ts
 export {
   Registry,
+  Member,
   RoundRobinStrategy, LeastLoadedStrategy, RandomStrategy, createStrategy,
-  proxyRequest, drainAndReply,
+  proxyRequest,
   lookupAndProxy, pickAndRegister, lookupAndDeregister
 }
 
 export type {
   AllocationStrategy, MemberInfo, MemberWithLoad, ResolveResult,
-  RegistryOptions, ProxyRequestOptions,
+  RegistryOptions, MemberOptions, ProxyRequestOptions,
   LookupAndProxyOptions, LookupAndProxyResult,
   PickAndRegisterOptions, PickAndRegisterResult,
   LookupAndDeregisterOptions, LookupAndDeregisterResult

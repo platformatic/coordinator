@@ -1,6 +1,6 @@
 import type { FastifyRequest, FastifyReply, RouteHandlerMethod } from 'fastify'
-import { proxyRequest } from '../proxy-request.ts'
-import { drainAndReply } from '../drain-and-reply.ts'
+import type { FastifyReplyFromHooks } from '@fastify/reply-from'
+import '@fastify/reply-from'
 import type { Registry } from '../registry.ts'
 
 export type LookupAndDeregisterResult =
@@ -42,16 +42,22 @@ export function lookupAndDeregister (
       return reply.code(expectedStatus).send()
     }
 
-    const upstream = await proxyRequest(resolved.address, request, { timeout: registry.requestTimeout })
-
-    if (upstream.statusCode === expectedStatus) {
-      await upstream.body.dump()
-      await registry.deregisterInstance(instanceId)
-      onResult?.('deregistered')
-      return reply.code(expectedStatus).send()
+    const onResponse: FastifyReplyFromHooks['onResponse'] = (_req, replyOut, res) => {
+      if (res.statusCode === expectedStatus) {
+        res.stream.resume()
+        registry.deregisterInstance(instanceId).then(
+          () => {
+            onResult?.('deregistered')
+            replyOut.send()
+          },
+          (err) => replyOut.send(err)
+        )
+      } else {
+        onResult?.('upstream_error')
+        replyOut.send(res.stream)
+      }
     }
 
-    onResult?.('upstream_error')
-    return drainAndReply(reply, upstream)
+    return reply.from(`${resolved.address}${request.url}`, { onResponse })
   }
 }

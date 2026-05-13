@@ -1,5 +1,7 @@
+import { Buffer } from 'node:buffer'
 import type { FastifyRequest, FastifyReply, RouteHandlerMethod } from 'fastify'
-import { proxyRequest } from '../proxy-request.ts'
+import type { FastifyReplyFromHooks } from '@fastify/reply-from'
+import '@fastify/reply-from'
 import type { Registry } from '../registry.ts'
 
 export type PickAndRegisterResult = 'spawned' | 'unavailable' | 'upstream_error'
@@ -29,17 +31,37 @@ export function pickAndRegister (
       return reply.code(503).send({ error: unavailableMessage })
     }
 
-    const upstream = await proxyRequest(member.address, request, { timeout: registry.requestTimeout })
-    const body = await upstream.body.json() as any
+    const onResponse: FastifyReplyFromHooks['onResponse'] = (_req, replyOut, res) => {
+      const chunks: Buffer[] = []
+      res.stream.on('data', (c: Buffer) => chunks.push(c))
+      res.stream.on('end', () => {
+        const raw = Buffer.concat(chunks).toString('utf8')
+        let body: any
+        try {
+          body = raw.length > 0 ? JSON.parse(raw) : null
+        } catch {
+          onResult?.('upstream_error')
+          replyOut.send(raw)
+          return
+        }
 
-    if (upstream.statusCode === expectedStatus) {
-      const id = registerIdFrom(body)
-      await registry.registerInstance(id, member.memberId)
-      onResult?.('spawned')
-    } else {
-      onResult?.('upstream_error')
+        if (res.statusCode === expectedStatus) {
+          const id = registerIdFrom(body)
+          registry.registerInstance(id, member.memberId).then(
+            () => {
+              onResult?.('spawned')
+              replyOut.send(body)
+            },
+            (err) => replyOut.send(err)
+          )
+        } else {
+          onResult?.('upstream_error')
+          replyOut.send(body)
+        }
+      })
+      res.stream.on('error', (err: Error) => replyOut.send(err))
     }
 
-    return reply.code(upstream.statusCode).send(body)
+    return reply.from(`${member.address}${request.url}`, { onResponse })
   }
 }

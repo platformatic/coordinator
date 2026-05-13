@@ -1,6 +1,5 @@
 import type { FastifyRequest, FastifyReply, RouteHandlerMethod } from 'fastify'
-import { proxyRequest } from '../proxy-request.ts'
-import { drainAndReply } from '../drain-and-reply.ts'
+import '@fastify/reply-from'
 import type { Registry } from '../registry.ts'
 
 export type LookupAndProxyResult = 'hit' | 'orphan_reassigned' | 'not_found'
@@ -33,8 +32,6 @@ export function lookupAndProxy (
     }
 
     onResult?.(resolved.reassigned ? 'orphan_reassigned' : 'hit')
-
-    const upstream = await proxyRequest(resolved.address, request, { timeout: registry.requestTimeout })
-    return drainAndReply(reply, upstream)
+    return reply.from(`${resolved.address}${request.url}`)
   }
 }
