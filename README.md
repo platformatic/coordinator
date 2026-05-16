@@ -93,7 +93,7 @@ const registry = new Registry({
 })
 
 // Hot path: resolve a destination, pick one pod, return its address.
-const resolved = await registry.resolveInstance(destId, {
+const resolved = await registry.resolveDestination(destId, {
   claimOnMiss: true,      // SADD a fresh pod if the destination's set is empty
   reassignOrphans: true   // SREM dead + SADD fresh if every pod in the set is dead
 })
@@ -108,17 +108,17 @@ if (lockRouting) {
 }
 
 // Other primitives:
-await registry.listLiveMembers()                // [{ memberId, address, totalConnections }, ...]
-await registry.pickMember({ instanceId: destId })
+await registry.listLiveMembers()                  // [{ memberId, address, load }, ...]
+await registry.pickMember({ destinationId: destId })
 await registry.addPodToDestination(destId, memberId)
 await registry.hasBinding(destId)
-await registry.deregisterInstance(destId)
+await registry.deregisterDestination(destId)
 await registry.close()
 ```
 
 ## Resolution and failover
 
-`resolveInstance` reads the destination's pod set, filters by liveness, and applies the allocation strategy. The four cases:
+`resolveDestination` reads the destination's pod set, filters by liveness, and applies the allocation strategy. The four cases:
 
 | Set state | `claimOnMiss` | `reassignOrphans` | Result |
 |---|---|---|---|
@@ -136,17 +136,17 @@ Pluggable. Built-in: `round-robin` (default), `least-loaded`, `random`. Custom s
 
 ```ts
 interface AllocationStrategy {
-  pick (candidates: MemberInfo[], ctx: { instanceId?: string }): MemberInfo | null
+  pick (candidates: MemberInfo[], ctx: { destinationId?: string }): MemberInfo | null
 }
 ```
 
-`candidates` is the pool to choose from -- the full live set on first-touch / failover, or the live members of a destination's pod set on the hot path for fanned-out destinations. `ctx.instanceId` is the destination, so custom strategies can branch on it (for example, pin "dedicated" tenants to a designated subset of pods and round-robin "shared" tenants across the rest).
+`candidates` is the pool to choose from -- the full live set on first-touch / failover, or the live members of a destination's pod set on the hot path for fanned-out destinations. `ctx.destinationId` is the destination, so custom strategies can branch on it (for example, pin "dedicated" tenants to a designated subset of pods and round-robin "shared" tenants across the rest).
 
-Built-in least-loaded reads `total_connections` from each candidate's member record (`HGET` pipeline). It runs at first touch for single-pod destinations and on every request for fanned-out destinations.
+Built-in least-loaded reads `load` from each candidate's member record (`HGET` pipeline). It runs at first touch for single-pod destinations and on every request for fanned-out destinations.
 
 ## TTL cache
 
-`resolveInstance` checks a local LRU+TTL cache before reading Valkey. Default 5 s TTL, 10 000 entries. Configure with `cache: { ttl, max }` or disable with `cache: false`. Writes through the registry (`addPodToDestination`, `deregisterInstance`) evict the affected key. Each replica has its own cache.
+`resolveDestination` checks a local LRU+TTL cache before reading Valkey. Default 5 s TTL, 10 000 entries. Configure with `cache: { ttl, max }` or disable with `cache: false`. Writes through the registry (`addPodToDestination`, `deregisterDestination`) evict the affected key. Each replica has its own cache.
 
 ## Fastify helpers
 
@@ -155,20 +155,20 @@ For HTTP-based coordinators, three helpers wrap the common patterns. Each emits 
 ### `lookupAndProxy`
 
 ```ts
-app.post('/instances/:id/work', lookupAndProxy(registry, {
-  instanceFrom: req => req.params.id,
+app.post('/destinations/:id/work', lookupAndProxy(registry, {
+  destinationFrom: req => req.params.id,
   reassignOrphans: true,
   onResult: result => metrics.inc({ type: 'work', result }) // 'hit' | 'orphan_reassigned' | 'not_found'
 }))
 ```
 
-Resolves the instance, proxies via `reply.from`, returns 404 if the destination has no live pod.
+Resolves the destination, proxies via `reply.from`, returns 404 if the destination has no live pod.
 
 ### `pickAndRegister`
 
 ```ts
-app.post('/instances', pickAndRegister(registry, {
-  registerIdFrom: res => res.instanceId
+app.post('/destinations', pickAndRegister(registry, {
+  registerIdFrom: res => res.id
 }))
 ```
 
@@ -177,8 +177,8 @@ Picks a pod, proxies the create request, and `SADD`s the returned id to the dest
 ### `lookupAndDeregister`
 
 ```ts
-app.delete('/instances/:id', lookupAndDeregister(registry, {
-  instanceFrom: req => req.params.id
+app.delete('/destinations/:id', lookupAndDeregister(registry, {
+  destinationFrom: req => req.params.id
 }))
 ```
 

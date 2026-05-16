@@ -152,7 +152,7 @@ Valkey is the shared coordination layer for live pod membership, destination own
 
 | Key | Shape | TTL | Owned by | Purpose |
 |---|---|---|---|---|
-| `<prefix>:member:<podId>` | hash with fields `address` and `total_connections` | 30 s, refreshed by heartbeat | resource pod | live pod registration and load metric |
+| `<prefix>:member:<podId>` | hash with fields `address` and `load` | 30 s, refreshed by heartbeat | resource pod | live pod registration and load metric |
 | `<prefix>:destination:<destinationId>` | set of `podId` values | none | coordinator and resource pod | the destination's pod set, sole source of truth for routing |
 | `<prefix>:lock:<lockId>` | hash with `podId`, `destinationId`, and lock metadata | session or lock lifetime | resource pod | resolve lock-bound follow-up calls |
 
@@ -182,9 +182,28 @@ When a fanned-out destination loses one of its pods, the others keep serving. Th
 
 ## Load Metrics and Fan-out
 
-Each resource pod publishes its current load to Valkey on every heartbeat. The heartbeat updates the `total_connections` field of the member record (`HSET <prefix>:member:<id> total_connections <N>`) in the same pipeline that resets the record's TTL. The field is named `total_connections` for historical reasons (the database case), but the value is just an integer load metric; the meaning is whatever the pod decides via `getTotalConnections`. It serves operator scaling decisions and the runtime fan-out logic below.
+Each resource pod publishes a single integer load value to Valkey on every heartbeat. The heartbeat updates the `load` field of the member record (`HSET <prefix>:member:<id> load <N>`) in the same pipeline that resets the record's TTL. The value's meaning is whatever the pod decides via `getLoad`: open connections, active sessions, queued requests, GPU utilisation, anything that monotonically grows with how stretched the pod is. It serves operator scaling decisions and the runtime fan-out logic below.
 
-A destination is normally bound to one pod. When that pod's local share for a destination saturates (the per-destination cap is reached and the wait queue stays non-empty past a configured threshold), the pod fans the destination out. It reads `total_connections` for every live pod, picks the one with the smallest count, and adds it to the destination's pod set: `SADD <prefix>:destination:X memberId`. The coordinator notices the expanded set on the next lookup and starts splitting requests across both pods.
+A destination is normally bound to one pod. When that pod's local share for a destination saturates (the per-destination cap is reached and the wait queue stays non-empty past a configured threshold), the pod fans the destination out. It reads `load` for every live pod, picks the one with the smallest value, and adds it to the destination's pod set: `SADD <prefix>:destination:X memberId`. The coordinator notices the expanded set on the next lookup and starts splitting requests across both pods.
+
+### Worked example: PostgreSQL connection pool
+
+The pattern was first developed for a multi-tenant database tier. The mapping:
+
+| Abstract concept | PostgreSQL implementation |
+|---|---|
+| Resource pod | A pod running a PostgreSQL connection pool process, fronting one or more tenant databases |
+| Destination | A tenant id (one logical database / schema bundle per tenant) |
+| Local share | The per-tenant subset of pool connections for that destination |
+| `load` | Total open PostgreSQL connections on the pod across all tenants (`pool.openCount()`) |
+| Saturation signal | Per-tenant pool capped *and* request wait queue non-empty past a threshold |
+| Lock ID | An opaque token returned by `beginTransaction`, mapped on the pod to one pinned PG connection inside a `BEGIN` block |
+| Pinned resource | The PostgreSQL connection holding the open transaction |
+| Cold local share opening on first hit | The pod lazily opens a new per-tenant pool slice the first time it receives a request for a tenant after being added to that tenant's destination set |
+
+In this case the scaler uses the same `load` value as a global signal: total open connections across the database tier divided by pod count. When that exceeds a threshold (well below the PostgreSQL `max_connections` limit, with headroom), the scaler adds a database pod; existing tenants stay sticky and new ones land on the new pod via the allocation strategy.
+
+The same pattern applies, with different mappings, to AI agent processes (load = active sessions; lock = an in-progress agent step), sandbox runners (load = active sandboxes; lock = an attached debugger session), or simulation workers (load = active simulations; lock = an in-flight tick).
 
 ```mermaid
 sequenceDiagram
@@ -194,7 +213,7 @@ sequenceDiagram
     participant R as Coordinator on next request for dest X
 
     Pod1->>Pod1: detect saturation for dest X
-    Pod1->>V: read total_connections for live pods
+    Pod1->>V: read load for live pods
     Pod1->>Pod1: pick smallest count, pod 2
     Pod1->>V: SADD <prefix>:destination:X pod 2
 
@@ -208,7 +227,7 @@ sequenceDiagram
 
 The saturating pod initiates fan-out, not the coordinator. The decision is local: the pod sees its own share saturating and acts. Multiple pods can fan in over time if load keeps climbing; each adds itself at most once.
 
-The coordinator picks among a destination's pod set on the request path using the same `AllocationStrategy` as first-touch. With `round-robin`, requests cycle through the destination's pods. With `least-loaded`, each request goes to the pod in the set with the fewest total connections.
+The coordinator picks among a destination's pod set on the request path using the same `AllocationStrategy` as first-touch. With `round-robin`, requests cycle through the destination's pods. With `least-loaded`, each request goes to the pod in the set with the lowest `load`.
 
 Reducing fan-out (removing a pod from a destination's set when load drops) is not a runtime concern. It is an operator action or a slow background reconciler; running it from the data path risks thrash under bursty load.
 
@@ -223,7 +242,7 @@ The in-process co-location of caller and coordinator inside one process is a sep
 
 ## Scaling
 
-The scaler reads each pod's `total_connections` from Valkey and adds a resource pod when it climbs past a threshold. Platformatic ICC supports arbitrary metrics, including this one. New destinations land on the new pod via the allocation strategy; existing destinations stay sticky.
+The scaler reads each pod's `load` from Valkey and adds a resource pod when it climbs past a threshold. Platformatic ICC supports arbitrary metrics, including this one. New destinations land on the new pod via the allocation strategy; existing destinations stay sticky.
 
 ### How allocation works
 
@@ -233,14 +252,14 @@ The flow at first touch:
 
 1. Coordinator receives a request for destination *D*.
 2. Registry runs `SMEMBERS <prefix>:destination:D`; set is empty.
-3. Registry calls `strategy.pick(liveMembers, { instanceId: D })`.
+3. Registry calls `strategy.pick(liveMembers, { destinationId: D })`.
 4. Registry runs `SADD <prefix>:destination:D <pickedPod>`. Concurrent racers each add their pick; the set's members are all valid serving pods for D.
 5. Coordinator forwards to the picked pod.
 
 Built-in strategies:
 
 - **Round-robin**: each coordinator replica keeps an in-memory cursor that advances per pick. Different replicas have independent cursors but over time spread evenly across pods. Zero Valkey reads per pick.
-- **Least-loaded**: reads `total_connections` from each candidate pod's member record (a pipeline of `HGET`s). Smallest wins; ties go round-robin. One extra Valkey round-trip per pick. For single-pod destinations, that means first touch only; for fanned-out destinations the cost lands on every request.
+- **Least-loaded**: reads `load` from each candidate pod's member record (a pipeline of `HGET`s). Smallest wins; ties go round-robin. One extra Valkey round-trip per pick. For single-pod destinations, that means first touch only; for fanned-out destinations the cost lands on every request.
 - **Random**: a `Math.random()`. For zero-coordination sharding.
 
 Custom strategies receive the destination ID through the context and can branch on it. For example, send tagged "dedicated" tenants to a designated pod and round-robin "shared" ones across the rest. The classification source is left to the integrator: a config service, a Valkey tag, a database lookup.
