@@ -39,7 +39,7 @@ With `keyPrefix: 'myservice'`:
 | Key | Type | Owner | Purpose |
 |---|---|---|---|
 | `myservice:members` | set | pod | the set of memberIds known to be live |
-| `myservice:member:<memberId>` | hash with `address`, `total_connections` | pod | live pod registration and load metric, TTL refreshed by heartbeat |
+| `myservice:member:<memberId>` | hash with `address`, `load` | pod | live pod registration and load metric, TTL refreshed by heartbeat |
 | `myservice:destination:<id>` | set of memberIds | coordinator + pod | pods currently serving this destination |
 | `myservice:lock:<lockId>` | hash with `podId`, `destinationId`, metadata | pod | lockId routing for transaction-bound calls |
 
@@ -55,8 +55,8 @@ const member = new Member({
   memberId: 'pod-1',
   address: 'http://pod-1.local:3000',
   keyPrefix: 'myservice',
-  ttl: 30,                                    // seconds; default 30
-  getTotalConnections: () => pool.openCount() // optional; default () => 0
+  ttl: 30,                          // seconds; default 30
+  getLoad: () => pool.openCount()   // optional; default () => 0
 })
 
 await member.register()                                 // SADD + HSET + EXPIRE
@@ -71,7 +71,7 @@ await member.removeFromDestination(destId)
 await member.registerLock(lockId, destId, { isolationLevel: 'serializable' })
 await member.unregisterLock(lockId)
 
-// Peer query for fan-out picks (returns live pods with total_connections):
+// Peer query for fan-out picks (returns live pods with their load):
 const peers = await member.listPeerLoad()
 
 // Graceful shutdown:

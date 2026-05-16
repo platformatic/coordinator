@@ -8,5 +8,4 @@ services:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
       timeout: 2s
-- ⚡ **Serverless architecture** powered by Vercel Workflow
       retries: 10

@@ -1,11 +1,11 @@
 export interface MemberInfo {
   memberId: string
   address: string
-  totalConnections: number
+  load: number
 }
 
 export interface PickContext {
-  instanceId?: string
+  destinationId?: string
 }
 
 export interface AllocationStrategy {
@@ -28,8 +28,8 @@ export class LeastLoadedStrategy implements AllocationStrategy {
 
   pick (candidates: MemberInfo[], _ctx: PickContext): MemberInfo | null {
     if (candidates.length === 0) return null
-    const min = Math.min(...candidates.map(m => m.totalConnections))
-    const tied = candidates.filter(m => m.totalConnections === min)
+    const min = Math.min(...candidates.map(m => m.load))
+    const tied = candidates.filter(m => m.load === min)
     const member = tied[this.#tieBreaker % tied.length]
     this.#tieBreaker = (this.#tieBreaker + 1) % tied.length
     return member

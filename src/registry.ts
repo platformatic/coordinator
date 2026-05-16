@@ -24,7 +24,7 @@ export interface ResolveLockResult {
 interface MemberRecord {
   memberId: string
   address: string | null
-  totalConnections: number
+  load: number
 }
 
 export class Registry {
@@ -72,7 +72,7 @@ export class Registry {
 
     const pipeline = this.#redis.pipeline()
     for (const id of memberIds) {
-      pipeline.hmget(this.#memberKey(id), 'address', 'total_connections')
+      pipeline.hmget(this.#memberKey(id), 'address', 'load')
     }
     const results = await pipeline.exec()
     if (!results) return []
@@ -83,43 +83,43 @@ export class Registry {
       if (err || !fields) continue
       const address = fields[0]
       if (!address) continue
-      const totalConnections = parseInt(fields[1] ?? '0', 10) || 0
-      live.push({ memberId: memberIds[i], address, totalConnections })
+      const load = parseInt(fields[1] ?? '0', 10) || 0
+      live.push({ memberId: memberIds[i], address, load })
     }
     return live
   }
 
-  async pickMember (ctx: { instanceId?: string } = {}): Promise<MemberInfo | null> {
+  async pickMember (ctx: { destinationId?: string } = {}): Promise<MemberInfo | null> {
     const live = await this.listLiveMembers()
     return this.#strategy.pick(live, ctx)
   }
 
-  async resolveInstance (
-    instanceId: string,
+  async resolveDestination (
+    destinationId: string,
     opts: { claimOnMiss?: boolean, reassignOrphans?: boolean } = {}
   ): Promise<ResolveResult | null> {
     if (this.#cache) {
-      const cached = this.#cache.get(instanceId)
+      const cached = this.#cache.get(destinationId)
       if (cached) return cached
     }
-    const result = await this.#resolveInstanceUncached(instanceId, opts)
-    if (this.#cache && result) this.#cache.set(instanceId, result)
+    const result = await this.#resolveDestinationUncached(destinationId, opts)
+    if (this.#cache && result) this.#cache.set(destinationId, result)
     return result
   }
 
-  async #resolveInstanceUncached (
-    instanceId: string,
+  async #resolveDestinationUncached (
+    destinationId: string,
     opts: { claimOnMiss?: boolean, reassignOrphans?: boolean }
   ): Promise<ResolveResult | null> {
-    const podIds = await this.#redis.smembers(this.#destinationKey(instanceId))
+    const podIds = await this.#redis.smembers(this.#destinationKey(destinationId))
 
     if (podIds.length === 0) {
       if (!opts.claimOnMiss) return null
       const live = await this.listLiveMembers()
       if (live.length === 0) return null
-      const picked = this.#strategy.pick(live, { instanceId })
+      const picked = this.#strategy.pick(live, { destinationId })
       if (!picked) return null
-      await this.#redis.sadd(this.#destinationKey(instanceId), picked.memberId)
+      await this.#redis.sadd(this.#destinationKey(destinationId), picked.memberId)
       return { address: picked.address, memberId: picked.memberId, reassigned: false }
     }
 
@@ -128,7 +128,7 @@ export class Registry {
     const deadPods: string[] = []
     for (const r of records) {
       if (r.address) {
-        livePods.push({ memberId: r.memberId, address: r.address, totalConnections: r.totalConnections })
+        livePods.push({ memberId: r.memberId, address: r.address, load: r.load })
       } else {
         deadPods.push(r.memberId)
       }
@@ -136,9 +136,9 @@ export class Registry {
 
     if (livePods.length > 0) {
       if (deadPods.length > 0) {
-        this.#redis.srem(this.#destinationKey(instanceId), ...deadPods).catch(() => {})
+        this.#redis.srem(this.#destinationKey(destinationId), ...deadPods).catch(() => {})
       }
-      const picked = this.#strategy.pick(livePods, { instanceId })
+      const picked = this.#strategy.pick(livePods, { destinationId })
       if (!picked) return null
       return { address: picked.address, memberId: picked.memberId, reassigned: false }
     }
@@ -146,14 +146,14 @@ export class Registry {
     if (!opts.reassignOrphans) return null
     const live = await this.listLiveMembers()
     if (live.length === 0) return null
-    const picked = this.#strategy.pick(live, { instanceId })
+    const picked = this.#strategy.pick(live, { destinationId })
     if (!picked) return null
 
     const pipeline = this.#redis.pipeline()
     for (const deadId of deadPods) {
-      pipeline.srem(this.#destinationKey(instanceId), deadId)
+      pipeline.srem(this.#destinationKey(destinationId), deadId)
     }
-    pipeline.sadd(this.#destinationKey(instanceId), picked.memberId)
+    pipeline.sadd(this.#destinationKey(destinationId), picked.memberId)
     await pipeline.exec()
 
     return { address: picked.address, memberId: picked.memberId, reassigned: true }
@@ -163,27 +163,27 @@ export class Registry {
     if (memberIds.length === 0) return []
     const pipeline = this.#redis.pipeline()
     for (const id of memberIds) {
-      pipeline.hmget(this.#memberKey(id), 'address', 'total_connections')
+      pipeline.hmget(this.#memberKey(id), 'address', 'load')
     }
     const results = await pipeline.exec()
-    if (!results) return memberIds.map(memberId => ({ memberId, address: null, totalConnections: 0 }))
+    if (!results) return memberIds.map(memberId => ({ memberId, address: null, load: 0 }))
 
     return memberIds.map((memberId, i) => {
       const [err, fields] = results[i] as [Error | null, (string | null)[] | null]
-      if (err || !fields) return { memberId, address: null, totalConnections: 0 }
+      if (err || !fields) return { memberId, address: null, load: 0 }
       const address = fields[0] ?? null
-      const totalConnections = parseInt(fields[1] ?? '0', 10) || 0
-      return { memberId, address, totalConnections }
+      const load = parseInt(fields[1] ?? '0', 10) || 0
+      return { memberId, address, load }
     })
   }
 
-  async addPodToDestination (instanceId: string, memberId: string): Promise<void> {
-    await this.#redis.sadd(this.#destinationKey(instanceId), memberId)
-    if (this.#cache) this.#cache.delete(instanceId)
+  async addPodToDestination (destinationId: string, memberId: string): Promise<void> {
+    await this.#redis.sadd(this.#destinationKey(destinationId), memberId)
+    if (this.#cache) this.#cache.delete(destinationId)
   }
 
-  async hasBinding (instanceId: string): Promise<boolean> {
-    const count = await this.#redis.scard(this.#destinationKey(instanceId))
+  async hasBinding (destinationId: string): Promise<boolean> {
+    const count = await this.#redis.scard(this.#destinationKey(destinationId))
     return count > 0
   }
 
@@ -195,13 +195,13 @@ export class Registry {
     return { address, memberId: podId }
   }
 
-  invalidateCache (instanceId: string): void {
-    if (this.#cache) this.#cache.delete(instanceId)
+  invalidateCache (destinationId: string): void {
+    if (this.#cache) this.#cache.delete(destinationId)
   }
 
-  async deregisterInstance (instanceId: string): Promise<void> {
-    await this.#redis.del(this.#destinationKey(instanceId))
-    if (this.#cache) this.#cache.delete(instanceId)
+  async deregisterDestination (destinationId: string): Promise<void> {
+    await this.#redis.del(this.#destinationKey(destinationId))
+    if (this.#cache) this.#cache.delete(destinationId)
   }
 
   async close (): Promise<void> {

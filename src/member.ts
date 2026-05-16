@@ -7,7 +7,7 @@ export interface MemberOptions {
   address: string
   keyPrefix?: string
   ttl?: number
-  getTotalConnections?: () => number
+  getLoad?: () => number
 }
 
 export class Member {
@@ -16,7 +16,7 @@ export class Member {
   #address: string
   #keyPrefix: string
   #ttl: number
-  #getTotalConnections: () => number
+  #getLoad: () => number
 
   constructor (opts: MemberOptions) {
     this.#redis = new Redis(opts.redis)
@@ -24,7 +24,7 @@ export class Member {
     this.#address = opts.address
     this.#keyPrefix = opts.keyPrefix ?? 'coordinator'
     this.#ttl = opts.ttl ?? 30
-    this.#getTotalConnections = opts.getTotalConnections ?? (() => 0)
+    this.#getLoad = opts.getLoad ?? (() => 0)
   }
 
   get memberId (): string {
@@ -56,7 +56,7 @@ export class Member {
     pipeline.sadd(this.#membersKey(), this.#memberId)
     pipeline.hset(this.#memberKey(), {
       address: this.#address,
-      total_connections: String(this.#getTotalConnections())
+      load: String(this.#getLoad())
     })
     pipeline.expire(this.#memberKey(), this.#ttl)
     await pipeline.exec()
@@ -64,7 +64,7 @@ export class Member {
 
   async heartbeat (): Promise<void> {
     const pipeline = this.#redis.pipeline()
-    pipeline.hset(this.#memberKey(), 'total_connections', String(this.#getTotalConnections()))
+    pipeline.hset(this.#memberKey(), 'load', String(this.#getLoad()))
     pipeline.expire(this.#memberKey(), this.#ttl)
     await pipeline.exec()
   }
@@ -106,7 +106,7 @@ export class Member {
 
     const pipeline = this.#redis.pipeline()
     for (const id of memberIds) {
-      pipeline.hmget(this.#memberKey(id), 'address', 'total_connections')
+      pipeline.hmget(this.#memberKey(id), 'address', 'load')
     }
     const results = await pipeline.exec()
     if (!results) return []
@@ -117,8 +117,8 @@ export class Member {
       if (err || !fields) continue
       const address = fields[0]
       if (!address) continue
-      const totalConnections = parseInt(fields[1] ?? '0', 10) || 0
-      live.push({ memberId: memberIds[i], address, totalConnections })
+      const load = parseInt(fields[1] ?? '0', 10) || 0
+      live.push({ memberId: memberIds[i], address, load })
     }
     return live
   }

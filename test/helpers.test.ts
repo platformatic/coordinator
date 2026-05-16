@@ -70,17 +70,17 @@ async function createCoordinator (registry: Registry): Promise<ReturnType<typeof
   app.post('/resources/:id/echo',
     { schema: { body: { type: 'object', properties: { msg: { type: 'string' } } } } },
     lookupAndProxy(registry, {
-      instanceFrom: (req: any) => req.params.id,
+      destinationFrom: (req: any) => req.params.id,
       reassignOrphans: true
     }))
 
   app.post('/resources/:id/heartbeat', lookupAndProxy(registry, {
-    instanceFrom: (req: any) => req.params.id,
+    destinationFrom: (req: any) => req.params.id,
     reassignOrphans: true
   }))
 
   app.delete('/resources/:id', lookupAndDeregister(registry, {
-    instanceFrom: (req: any) => req.params.id
+    destinationFrom: (req: any) => req.params.id
   }))
 
   return app
@@ -88,7 +88,7 @@ async function createCoordinator (registry: Registry): Promise<ReturnType<typeof
 
 async function makeLivePod (redis: Redis, memberId: string, address: string): Promise<void> {
   await redis.sadd(membersKey(), memberId)
-  await redis.hset(memberKey(memberId), { address, total_connections: '0' })
+  await redis.hset(memberKey(memberId), { address, load: '0' })
   await redis.expire(memberKey(memberId), 60)
 }
 
@@ -170,7 +170,7 @@ test('Coordinator helpers', async (t) => {
     })
     strictEqual(res.statusCode, 404)
     const body = res.json() as any
-    strictEqual(body.error, 'Instance not found')
+    strictEqual(body.error, 'Destination not found')
   })
 
   await t.test('lookupAndProxy: reassigns orphan when reassignOrphans is true', async () => {

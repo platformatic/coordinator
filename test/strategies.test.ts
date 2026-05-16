@@ -4,12 +4,12 @@ import { RoundRobinStrategy, LeastLoadedStrategy, RandomStrategy, createStrategy
 import type { MemberInfo } from '../src/strategies.ts'
 
 const members: MemberInfo[] = [
-  { memberId: 'pod-1', address: 'http://localhost:3001', totalConnections: 5 },
-  { memberId: 'pod-2', address: 'http://localhost:3002', totalConnections: 2 },
-  { memberId: 'pod-3', address: 'http://localhost:3003', totalConnections: 8 }
+  { memberId: 'pod-1', address: 'http://localhost:3001', load: 5 },
+  { memberId: 'pod-2', address: 'http://localhost:3002', load: 2 },
+  { memberId: 'pod-3', address: 'http://localhost:3003', load: 8 }
 ]
 
-const ctx = { instanceId: 'inst-x' }
+const ctx = { destinationId: 'inst-x' }
 
 test('RoundRobinStrategy - cycles through candidates', () => {
   const strategy = new RoundRobinStrategy()
@@ -33,15 +33,15 @@ test('LeastLoadedStrategy - picks candidate with fewest total connections', () =
   const picked = new LeastLoadedStrategy().pick(members, ctx)
   ok(picked)
   strictEqual(picked.memberId, 'pod-2')
-  strictEqual(picked.totalConnections, 2)
+  strictEqual(picked.load, 2)
 })
 
 test('LeastLoadedStrategy - breaks ties with round-robin', () => {
   const strategy = new LeastLoadedStrategy()
   const tied: MemberInfo[] = [
-    { memberId: 'pod-a', address: 'http://a', totalConnections: 3 },
-    { memberId: 'pod-b', address: 'http://b', totalConnections: 3 },
-    { memberId: 'pod-c', address: 'http://c', totalConnections: 5 }
+    { memberId: 'pod-a', address: 'http://a', load: 3 },
+    { memberId: 'pod-b', address: 'http://b', load: 3 },
+    { memberId: 'pod-c', address: 'http://c', load: 5 }
   ]
 
   const first = strategy.pick(tied, ctx)
@@ -73,16 +73,16 @@ test('RandomStrategy - returns null for empty list', () => {
   strictEqual(new RandomStrategy().pick([], ctx), null)
 })
 
-test('Custom strategy receives ctx with instanceId', () => {
-  let seenInstanceId: string | undefined
+test('Custom strategy receives ctx with destinationId', () => {
+  let seenDestinationId: string | undefined
   const strategy = {
-    pick (candidates: MemberInfo[], pickCtx: { instanceId?: string }) {
-      seenInstanceId = pickCtx.instanceId
+    pick (candidates: MemberInfo[], pickCtx: { destinationId?: string }) {
+      seenDestinationId = pickCtx.destinationId
       return candidates[0] ?? null
     }
   }
-  strategy.pick(members, { instanceId: 'tenant-42' })
-  strictEqual(seenInstanceId, 'tenant-42')
+  strategy.pick(members, { destinationId: 'tenant-42' })
+  strictEqual(seenDestinationId, 'tenant-42')
 })
 
 test('createStrategy - returns correct strategy types', () => {

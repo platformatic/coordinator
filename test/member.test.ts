@@ -24,7 +24,7 @@ test('Member', async (t) => {
     memberId,
     address,
     keyPrefix: PREFIX,
-    getTotalConnections: () => connections
+    getLoad: () => connections
   })
 
   t.after(async () => {
@@ -43,14 +43,14 @@ test('Member', async (t) => {
     const isMember = await sharedRedis.sismember(membersKey(), memberId)
     strictEqual(isMember, 1)
 
-    const fields = await sharedRedis.hmget(memberKey(memberId), 'address', 'total_connections')
+    const fields = await sharedRedis.hmget(memberKey(memberId), 'address', 'load')
     deepStrictEqual(fields, [address, '7'])
 
     const ttl = await sharedRedis.ttl(memberKey(memberId))
     ok(ttl > 0 && ttl <= 30, `TTL should be between 1 and 30, got ${ttl}`)
   })
 
-  await t.test('heartbeat updates total_connections and refreshes TTL', async () => {
+  await t.test('heartbeat updates load and refreshes TTL', async () => {
     connections = 7
     await member.register()
 
@@ -60,7 +60,7 @@ test('Member', async (t) => {
 
     await member.heartbeat()
 
-    const updated = await sharedRedis.hget(memberKey(memberId), 'total_connections')
+    const updated = await sharedRedis.hget(memberKey(memberId), 'load')
     strictEqual(updated, '42')
 
     const ttlAfter = await sharedRedis.ttl(memberKey(memberId))
@@ -106,13 +106,13 @@ test('Member', async (t) => {
     strictEqual(exists, 0)
   })
 
-  await t.test('listPeerLoad returns live members with total_connections', async () => {
+  await t.test('listPeerLoad returns live members with load', async () => {
     connections = 5
     await member.register()
 
     // Add a peer manually.
     await sharedRedis.sadd(membersKey(), 'peer-1')
-    await sharedRedis.hset(memberKey('peer-1'), { address: 'http://peer:9000', total_connections: '12' })
+    await sharedRedis.hset(memberKey('peer-1'), { address: 'http://peer:9000', load: '12' })
     await sharedRedis.expire(memberKey('peer-1'), 30)
 
     const peers = await member.listPeerLoad()
@@ -121,8 +121,8 @@ test('Member', async (t) => {
     const self = peers.find(p => p.memberId === memberId)
     const peer = peers.find(p => p.memberId === 'peer-1')
     ok(self); ok(peer)
-    strictEqual(self.totalConnections, 5)
-    strictEqual(peer.totalConnections, 12)
+    strictEqual(self.load, 5)
+    strictEqual(peer.load, 12)
     strictEqual(peer.address, 'http://peer:9000')
   })
 
@@ -140,10 +140,10 @@ test('Member', async (t) => {
     await m.close()
   })
 
-  await t.test('getTotalConnections defaults to () => 0 when omitted', async () => {
+  await t.test('getLoad defaults to () => 0 when omitted', async () => {
     const m = new Member({ redis: REDIS_URL, memberId: 'm-default', address, keyPrefix: PREFIX })
     await m.register()
-    const v = await sharedRedis.hget(memberKey('m-default'), 'total_connections')
+    const v = await sharedRedis.hget(memberKey('m-default'), 'load')
     strictEqual(v, '0')
     await m.close()
   })
