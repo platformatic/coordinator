@@ -22,10 +22,10 @@ flowchart TB
     subgraph DL["Resource pods, stateful, few -- K8s Headless Service"]
         direction LR
         subgraph DPod1["Resource pod"]
-            Pool1["resource owner<br/>dest 1..41"]
+            Owner1["resource owner<br/>dest 1..41"]
         end
         subgraph DPod2["Resource pod"]
-            Pool2["resource owner<br/>dest 42..N"]
+            Owner2["resource owner<br/>dest 42..N"]
         end
     end
 
@@ -33,10 +33,10 @@ flowchart TB
 
     User --> LB --> App
     Router -->|"1. resolve destination"| Valkey
-    Router -->|"2. forward call over HTTP"| Pool2
+    Router -->|"2. forward call over HTTP"| Owner2
     DPod2 -.->|"3. reassign on failover"| Valkey
-    Pool1 --> Backend
-    Pool2 --> Backend
+    Owner1 --> Backend
+    Owner2 --> Backend
 ```
 
 Steps 1 and 2 run on every call; step 3 only on failover. The router-to-resource hop is the only HTTP hop on the resource path. It replaces the per-call overhead of local resource management with a single network hop to a warm shared owner.
@@ -87,7 +87,7 @@ The in-process channel between caller and coordinator is an optimization for co-
 
 ## Transactions and Locks
 
-Some resources are bound to a single owner for the lifetime of a session (a database transaction pinned to a connection, an agent step pinned to a process). Pinning happens on the resource pod under an opaque lock ID. When a destination is served by a single pod (the common case), destination-based routing is enough: every follow-up call lands on the pod that minted the lock. When a destination is fanned out across multiple pods (see "Connection Metrics and Fan-out"), the coordinator resolves the lock ID through Valkey to find the owning pod and forwards there. The resource pod validates the token against its lock table. The lock ID stays opaque to clients throughout; only the coordinator and resource owner know the routing record.
+Some resources are bound to a single owner for the lifetime of a session (a database transaction pinned to a connection, an agent step pinned to a process). Pinning happens on the resource pod under an opaque lock ID. When a destination is served by a single pod (the common case), destination-based routing is enough: every follow-up call lands on the pod that minted the lock. When a destination is fanned out across multiple pods (see "Load Metrics and Fan-out"), the coordinator resolves the lock ID through Valkey to find the owning pod and forwards there. The resource pod validates the token against its lock table. The lock ID stays opaque to clients throughout; only the coordinator and resource owner know the routing record.
 
 ```mermaid
 sequenceDiagram
@@ -142,7 +142,7 @@ Four invariants:
 |---|---|
 | **Caller application** (stateless) | HTTP, auth, request validation, business logic, building the resource request, calling the coordinator |
 | **Coordinator** (built on `@platformatic/coordinator`) | Coordinator entry point, Valkey destination resolution, HTTP forwarding, short-lived lookup cache, orphan detection and reassignment, picking among a destination's pod set when it is fanned out, routing locked calls by looking up the lock record in Valkey |
-| **Resource pod** | Local resource ownership (pools, sessions, sandboxes), destination provisioning, lifecycle, transactions/sessions, pinning, cancellation, retry policy, metrics, lock timeouts, Valkey self-registration and heartbeat, publishing total open connection count, detecting saturation, fanning a saturated destination out to the least-loaded live pod |
+| **Resource pod** | Local resource ownership (pools, sessions, sandboxes), destination provisioning, lifecycle, transactions/sessions, pinning, cancellation, retry policy, metrics, lock timeouts, Valkey self-registration and heartbeat, publishing a load metric, detecting saturation, fanning a saturated destination out to the least-loaded live pod |
 
 The coordinator does not understand application semantics, parse payloads, authenticate, or hold resource/session/lock state. Its only job is to pick the right resource pod and forward the call.
 
@@ -180,9 +180,9 @@ Locks and sessions on the dead pod are gone. The design does not try to migrate 
 
 When a fanned-out destination loses one of its pods, the others keep serving. The coordinator `SREM`s the dead member on the next lookup that observes a dead address; the remaining pods cover the destination with no cold-resource moment.
 
-## Connection Metrics and Fan-out
+## Load Metrics and Fan-out
 
-Each resource pod publishes its total open resource count to Valkey on every heartbeat. The heartbeat updates the `total_connections` field of the member record (`HSET <prefix>:member:<id> total_connections <N>`) in the same pipeline that resets the record's TTL. The field is named `total_connections` for the database case, but the value is just an integer load metric; the meaning is whatever the pod decides via `getTotalConnections`. It serves operator scaling decisions and the runtime fan-out logic below.
+Each resource pod publishes its current load to Valkey on every heartbeat. The heartbeat updates the `total_connections` field of the member record (`HSET <prefix>:member:<id> total_connections <N>`) in the same pipeline that resets the record's TTL. The field is named `total_connections` for historical reasons (the database case), but the value is just an integer load metric; the meaning is whatever the pod decides via `getTotalConnections`. It serves operator scaling decisions and the runtime fan-out logic below.
 
 A destination is normally bound to one pod. When that pod's local share for a destination saturates (the per-destination cap is reached and the wait queue stays non-empty past a configured threshold), the pod fans the destination out. It reads `total_connections` for every live pod, picks the one with the smallest count, and adds it to the destination's pod set: `SADD <prefix>:destination:X memberId`. The coordinator notices the expanded set on the next lookup and starts splitting requests across both pods.
 
@@ -253,7 +253,7 @@ Two tenant regimes coexist, and the design treats them differently.
 
 Low-volume tenants are many, each cheap. Round-robin or least-loaded allocation packs many destinations per pod. Cold-start cost is paid once per tenant on first hit; the warm footprint is small. Most tenants live their entire life on a single pod.
 
-High-volume tenants are few, each expensive. A single tenant can outgrow a single pod's local capacity. The architecture handles this *reactively* through fan-out (see "Connection Metrics and Fan-out"): when a tenant saturates a pod's local share, the pod adds another pod to the tenant's set and the coordinator spreads load across them. Per-tenant caps inside the resource owner keep one tenant from monopolizing a pod's budget while the fan-out signal builds.
+High-volume tenants are few, each expensive. A single tenant can outgrow a single pod's local capacity. The architecture handles this *reactively* through fan-out (see "Load Metrics and Fan-out"): when a tenant saturates a pod's local share, the pod adds another pod to the tenant's set and the coordinator spreads load across them. Per-tenant caps inside the resource owner keep one tenant from monopolizing a pod's budget while the fan-out signal builds.
 
 Reactive fan-out works well for tenants whose volume is hard to predict. For tenants known in advance to be heavy (a large enterprise customer, a regional shard), proactive provisioning is still useful: tag the tenant as "dedicated" at first touch and use a custom `AllocationStrategy` that pins it to a designated subset of pods from the start. The two mechanisms compose: a tenant pinned to a dedicated pod can still fan out further if it outgrows it.
 
