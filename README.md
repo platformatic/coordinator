@@ -2,6 +2,8 @@
 
 Multi-pod destination routing for stateful tiers. Valkey-backed registry, pod-side `Member` class, allocation strategies, lock routing, TTL cache, and optional Fastify helpers.
 
+See [`coordinator-pattern.md`](./coordinator-pattern.md) for the architecture this library implements: caller / coordinator / resource pod, failover, fan-out, transactions and locks.
+
 ## What it solves
 
 You have N pods that hold stateful resources (PostgreSQL connection pools, agent processes, sandboxes, simulations). Requests carry a routing key -- a "destination" or "instance" id. You need every request for that destination to land on a pod that owns it. Pods die; surviving pods should take over. Under sustained load, a single destination may need to live on more than one pod.
@@ -148,7 +150,7 @@ Built-in least-loaded reads `total_connections` from each candidate's member rec
 
 ## Fastify helpers
 
-For HTTP-based coordinators (e.g. `regina-coordinator`), three helpers wrap the common patterns. Each emits a tagged result via an optional `onResult` callback so presets can hook their own metric counters.
+For HTTP-based coordinators, three helpers wrap the common patterns. Each emits a tagged result via an optional `onResult` callback so presets can hook their own metric counters.
 
 ### `lookupAndProxy`
 
