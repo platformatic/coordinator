@@ -1,65 +1,49 @@
 # @platformatic/coordinator
 
-Sticky-instance coordinator library for multi-pod Fastify services. Routes a client's request -- carrying an instance id -- to the pod that owns that instance, using Redis as the source of truth. Provides a member registry, allocation strategies, three Fastify helpers for the common sticky-routing patterns, and small utilities for the parts that are easy to get wrong.
-
-This package is a library, not a Watt stackable. It is consumed by **preset stackables** (e.g. `@platformatic/regina-coordinator`) that publish their own API contract on top.
+Multi-pod destination routing for stateful tiers. Valkey-backed registry, pod-side `Member` class, allocation strategies, lock routing, TTL cache, and optional Fastify helpers.
 
 ## What it solves
 
-You have N pods, each holding stateful instances (chat sessions, connection pools, simulations, sandboxes). A client request carries an instance id. You need that request to land on the pod that owns that instance. When pods die, surviving pods should be able to take over (assuming they can rehydrate from shared state). Allocation of new instances should spread across pods.
+You have N pods that hold stateful resources (PostgreSQL connection pools, agent processes, sandboxes, simulations). Requests carry a routing key -- a "destination" or "instance" id. You need every request for that destination to land on a pod that owns it. Pods die; surviving pods should take over. Under sustained load, a single destination may need to live on more than one pod.
 
-## Concepts
+This library handles all of that:
 
-- **Member** -- a pod, identified by `memberId`, advertising its address. The pod registers itself in Redis on startup and keeps its address key alive with a TTL it refreshes from a heartbeat loop.
-- **Instance** -- an opaque id whose ownership is bound to a member. The coordinator writes this binding when an instance is created and reads it on every subsequent request.
-- **Sticky mapping** -- `instance -> member`, **no TTL**. Outlives the member's address key, which is what makes orphan detection possible.
-- **Allocation strategy** -- how a fresh instance is assigned to a member: round-robin, least-loaded, or random.
-
-## How a request is routed
-
-```mermaid
-graph TB
-    Client([Client]) -->|"POST /instances/<id>/work"| App[Fastify app]
-
-    subgraph Library["@platformatic/coordinator"]
-        App --> Helper["lookupAndProxy"]
-        Helper --> Registry
-        Helper --> Proxy[proxyRequest]
-    end
-
-    Registry <--> Redis[("Redis / Valkey")]
-    Proxy -->|"undici"| Pod1["Pod owning the instance"]
-    Pod1 --> Helper
-    Helper --> App
-    App --> Client
-```
-
-Per request: two Redis reads (instance mapping, then member address) plus one upstream HTTP call. Stateless across coordinator replicas because Redis is the source of truth.
+- Destination → pod set, persisted in Valkey
+- Pod self-registration + heartbeat, with `total_connections` published as a metric
+- Atomic first-touch claim, atomic failover (SREM dead + SADD fresh)
+- Pluggable allocation strategies (round-robin, least-loaded by total connections, random)
+- Lock routing for transaction-bound calls (lockId → pod, resolved via Valkey)
+- A short-lived local cache for the hot resolution path
+- Fastify helpers for HTTP coordinators
 
 ## Install
 
 ```sh
-npm install @platformatic/coordinator @fastify/reply-from
+npm install @platformatic/coordinator
 ```
 
-Peer dependencies: `fastify >= 5` and `@fastify/reply-from >= 12`. The helpers proxy upstream responses through `reply.from`, so the host application **must** register `@fastify/reply-from` once before any helper-backed route is mounted. Runtime dependencies: `iovalkey`, `undici`.
+For the Fastify helpers, also:
 
-## Redis layout
+```sh
+npm install @fastify/reply-from
+```
+
+Peer dependency: `fastify >= 5` when using the Fastify helpers.
+
+## Valkey layout
 
 With `keyPrefix: 'myservice'`:
 
-| Key                                       | Type   | Owner       | Notes                                   |
-|-------------------------------------------|--------|-------------|-----------------------------------------|
-| `myservice:members`                       | set    | pod         | the pod's `memberId` lives here         |
-| `myservice:member:<memberId>`             | string | pod         | pod's address; TTL refreshed by heartbeat |
-| `myservice:member:<memberId>:instances`   | string | pod         | pod's instance count (for `least-loaded`) |
-| `myservice:instance:<instanceId>`         | string | coordinator | binds instance to memberId, **no TTL**  |
+| Key | Type | Owner | Purpose |
+|---|---|---|---|
+| `myservice:members` | set | pod | the set of memberIds known to be live |
+| `myservice:member:<memberId>` | hash with `address`, `total_connections` | pod | live pod registration and load metric, TTL refreshed by heartbeat |
+| `myservice:destination:<id>` | set of memberIds | coordinator + pod | pods currently serving this destination |
+| `myservice:lock:<lockId>` | hash with `podId`, `destinationId`, metadata | pod | lockId routing for transaction-bound calls |
 
-The coordinator only writes the `:instance:` keys. Everything under `:members` and `:member:*` is owned by the pods themselves.
+## Pod side: `Member`
 
-## Pod responsibilities
-
-A pod that wants to participate in a coordinator-managed mesh uses the `Member` class, which encapsulates every Redis operation the pod side needs:
+The pod-side class owns its own iovalkey connection and writes the keys the pod is responsible for.
 
 ```ts
 import { Member } from '@platformatic/coordinator'
@@ -68,96 +52,115 @@ const member = new Member({
   redis: 'redis://valkey:6379',
   memberId: 'pod-1',
   address: 'http://pod-1.local:3000',
-  keyPrefix: 'myservice',  // must match the coordinator's keyPrefix
-  ttl: 30                  // optional, seconds; default 30
+  keyPrefix: 'myservice',
+  ttl: 30,                                    // seconds; default 30
+  getTotalConnections: () => pool.openCount() // optional; default () => 0
 })
 
-await member.register()                                // on startup
-const heartbeat = setInterval(() => member.heartbeat(), 10_000)  // every ~10s
+await member.register()                                 // SADD + HSET + EXPIRE
+const heartbeat = setInterval(() => member.heartbeat(), 10_000)  // HSET + EXPIRE
 heartbeat.unref()
 
-// when an instance is created/destroyed on this pod:
-await member.registerInstance(instanceId)
-await member.deregisterInstance(instanceId)
+// When this pod fans itself in to a destination:
+await member.addToDestination(destId)
+await member.removeFromDestination(destId)
 
-// on graceful shutdown:
+// When this pod mints / releases a transaction lock:
+await member.registerLock(lockId, destId, { isolationLevel: 'serializable' })
+await member.unregisterLock(lockId)
+
+// Peer query for fan-out picks (returns live pods with total_connections):
+const peers = await member.listPeerLoad()
+
+// Graceful shutdown:
 clearInterval(heartbeat)
 await member.deregister()
 await member.close()
 ```
 
-Under the hood `Member` performs the four Redis operations every coordinator-managed mesh requires:
+## Coordinator side: `Registry`
 
-1. **Register** -- `SADD <prefix>:members <memberId>` and `SET <prefix>:member:<memberId> <address> EX <ttl>`.
-2. **Heartbeat** -- `EXPIRE` on the address key. Skipping this is what marks the pod dead.
-3. **Track load** -- `INCR` / `DECR` on `<prefix>:member:<memberId>:instances` (used by `least-loaded`).
-4. **Deregister** -- `SREM` from the members set, `DEL` the address and load keys.
+```ts
+import { Registry } from '@platformatic/coordinator'
 
-`Member` owns its own Redis connection and never exposes it; pods don't need to depend on `iovalkey` directly.
+const registry = new Registry({
+  redis: 'redis://valkey:6379',
+  keyPrefix: 'myservice',
+  strategy: 'least-loaded',
+  cache: { ttl: 5000, max: 10_000 }  // default; pass `false` to disable
+})
+
+// Hot path: resolve a destination, pick one pod, return its address.
+const resolved = await registry.resolveInstance(destId, {
+  claimOnMiss: true,      // SADD a fresh pod if the destination's set is empty
+  reassignOrphans: true   // SREM dead + SADD fresh if every pod in the set is dead
+})
+if (resolved) {
+  // { address, memberId, reassigned }
+}
+
+// Lock-bound call: route by lockId, not destination.
+const lockRouting = await registry.resolveLock(lockId)
+if (lockRouting) {
+  // { address, memberId }
+}
+
+// Other primitives:
+await registry.listLiveMembers()                // [{ memberId, address, totalConnections }, ...]
+await registry.pickMember({ instanceId: destId })
+await registry.addPodToDestination(destId, memberId)
+await registry.hasBinding(destId)
+await registry.deregisterInstance(destId)
+await registry.close()
+```
+
+## Resolution and failover
+
+`resolveInstance` reads the destination's pod set, filters by liveness, and applies the allocation strategy. The four cases:
+
+| Set state | `claimOnMiss` | `reassignOrphans` | Result |
+|---|---|---|---|
+| Empty | false | -- | `null` (404 territory) |
+| Empty | true | -- | Pick a live pod, `SADD` it, return |
+| Has live pods (possibly with dead too) | -- | -- | Pick one of the live pods; dead ones cleaned up in background |
+| All dead, non-empty | -- | false | `null` |
+| All dead, non-empty | -- | true | Pick fresh, `SREM` dead + `SADD` fresh, return with `reassigned: true` |
+
+All writes use `SADD` / `SREM` (atomic). Concurrent first-touch by two coordinators can produce a destination with two pods from the start. That's a valid steady state, not a corrupted one.
 
 ## Allocation strategies
 
-```mermaid
-flowchart TD
-    A[New instance] --> B[Registry.listMembersWithLoad]
-    B --> C["SMEMBERS &lt;prefix&gt;:members"]
-    C --> D["MGET addresses + instance counts"]
-    D --> E{Strategy}
+Pluggable. Built-in: `round-robin` (default), `least-loaded`, `random`. Custom strategies implement:
 
-    E -->|round-robin| F["Next member in cycle"]
-    E -->|least-loaded| G["Member with min count<br/>(ties broken round-robin)"]
-    E -->|random| H["Math.random()"]
-
-    F --> I[Selected pod]
-    G --> I
-    H --> I
+```ts
+interface AllocationStrategy {
+  pick (candidates: MemberInfo[], ctx: { instanceId?: string }): MemberInfo | null
+}
 ```
 
-Pick one based on workload shape:
+`candidates` is the pool to choose from -- the full live set on first-touch / failover, or the live members of a destination's pod set on the hot path for fanned-out destinations. `ctx.instanceId` is the destination, so custom strategies can branch on it (for example, pin "dedicated" tenants to a designated subset of pods and round-robin "shared" tenants across the rest).
 
-- **`round-robin`** (default) -- even distribution, ignores load. Cheapest. Right when instances are roughly uniform in cost.
-- **`least-loaded`** -- reads each pod's instance count from Redis (one `MGET` round-trip), picks the minimum, breaks ties round-robin. Right when instances are heavy and you want to spread them (e.g. connection pools, long-lived simulations).
-- **`random`** -- one `Math.random()`. Right for sharded scenarios where you want zero coordination state.
+Built-in least-loaded reads `total_connections` from each candidate's member record (`HGET` pipeline). It runs at first touch for single-pod destinations and on every request for fanned-out destinations.
 
-You can also pass a custom `AllocationStrategy` instance to the `Registry` constructor.
+## TTL cache
 
-## Orphan detection
+`resolveInstance` checks a local LRU+TTL cache before reading Valkey. Default 5 s TTL, 10 000 entries. Configure with `cache: { ttl, max }` or disable with `cache: false`. Writes through the registry (`addPodToDestination`, `deregisterInstance`) evict the affected key. Each replica has its own cache.
 
-When a pod's address key TTL expires (pod crashed, pod missed heartbeats), its instance mappings still point at the dead `memberId`. The next request for one of those instances surfaces the situation:
+## Fastify helpers
 
-```mermaid
-flowchart TD
-    A[Request for instanceId] --> B{Lookup mapping}
-    B -->|Not found| E[404]
-    B -->|memberId exists| C{Member address alive?}
-    C -->|Yes| D[Proxy to pod]
-    C -->|No, reassignOrphans=false| F["{address: null}<br/>caller decides"]
-    C -->|No, reassignOrphans=true| G[Pick a live pod]
-    G --> H[Update mapping in Redis]
-    H --> I[Proxy to new pod]
-    I --> J["Pod rehydrates from<br/>shared state on first hit"]
-```
-
-`reassignOrphans` is opt-in **per call** (per route, in practice). Use `true` only when your pods can rebuild an instance's state from shared storage on demand. Use `false` (the default) when "pod is dead" should mean "instance is gone" -- the helper returns a `{ address: null }` result and the route handler decides what to do.
-
-## Sticky helpers
-
-Three Fastify route handlers cover the patterns that repeat across consumers. Each is a one-liner at the call site and captures one specific footgun. Helpers do not touch metrics directly -- they emit a tagged result via an optional `onResult` callback, which the preset can hook into to bump its own counters with whatever label scheme it likes.
+For HTTP-based coordinators (e.g. `regina-coordinator`), three helpers wrap the common patterns. Each emits a tagged result via an optional `onResult` callback so presets can hook their own metric counters.
 
 ### `lookupAndProxy`
 
 ```ts
 app.post('/instances/:id/work', lookupAndProxy(registry, {
   instanceFrom: req => req.params.id,
-  reassignOrphans: true
+  reassignOrphans: true,
+  onResult: result => metrics.inc({ type: 'work', result }) // 'hit' | 'orphan_reassigned' | 'not_found'
 }))
 ```
 
-Resolves the instance, proxies the request to the owning pod, drains the response. On unknown instance: 404. On dead pod with `reassignOrphans: false`: also 404. On dead pod with `reassignOrphans: true`: picks a new pod, rewrites the mapping, proxies there.
-
-Defaults: `reassignOrphans: false`, `notFoundMessage: 'Instance not found'`. Optional `onResult: (r) => void` is called with `'hit' | 'orphan_reassigned' | 'not_found'`.
-
-Doesn't handle: response-header rewrites, custom error envelopes. For those, resolve the instance yourself and call `reply.from(...)` inline (see "When the helper isn't enough" below).
+Resolves the instance, proxies via `reply.from`, returns 404 if the destination has no live pod.
 
 ### `pickAndRegister`
 
@@ -167,11 +170,7 @@ app.post('/instances', pickAndRegister(registry, {
 }))
 ```
 
-Picks a member via the strategy, proxies the create request to it, and registers the resulting id in Redis **only** if the upstream returns `expectedStatus`. The footgun this kills: forgetting to gate `registerInstance` on success, which would otherwise bind Redis mappings to instances the pod never created.
-
-On no live pods: 503 with the configured message. The upstream's response body is forwarded to the client verbatim.
-
-Defaults: `expectedStatus: 201`, `unavailableMessage: 'No pods available'`. Optional `onResult: (r) => void` is called with `'spawned' | 'unavailable' | 'upstream_error'`.
+Picks a pod, proxies the create request, and `SADD`s the returned id to the destination set only on a 2xx upstream response. Returns 503 if there are no live pods.
 
 ### `lookupAndDeregister`
 
@@ -181,147 +180,21 @@ app.delete('/instances/:id', lookupAndDeregister(registry, {
 }))
 ```
 
-Resolves the instance (no orphan reassignment -- a dead instance cannot be deleted). If the pod is alive, proxies the DELETE; on `expectedStatus`, drains and deregisters. If the pod is dead, **skips the proxy entirely** and just removes the Redis mapping. The footgun this kills: forcing a freshly assigned pod to spin an instance up just to delete it.
+Resolves, proxies the delete; on `expectedStatus` (204 by default), `DEL`s the destination set. If the destination has only dead pods, skips the proxy and just deletes the set ("deregistered_dead_pod").
 
-Defaults: `expectedStatus: 204`, `notFoundMessage: 'Instance not found'`. Optional `onResult: (r) => void` is called with `'deregistered' | 'deregistered_dead_pod' | 'not_found' | 'upstream_error'`.
-
-### When the helper isn't enough
-
-Helpers cover the simple case. For header overrides, response-body massaging, or alternative error shapes, resolve the instance yourself and forward with `reply.from`:
-
-```ts
-app.post('/instances/:id/stream', async (req, reply) => {
-  const resolved = await registry.resolveInstance(req.params.id, { reassignOrphans: true })
-  if (!resolved?.address) return reply.code(404).send({ error: 'Not found' })
-
-  return reply.from(`${resolved.address}${req.url}`, {
-    rewriteHeaders: (headers) => {
-      if ((headers['content-type'] as string | undefined)?.includes('text/event-stream')) {
-        headers['content-type'] = 'application/x-ndjson'
-      }
-      return headers
-    }
-  })
-})
-```
-
-## Utilities
-
-### `proxyRequest(address, req, opts?)`
-
-A small undici wrapper used for fan-out routes (where you want to call several pods in parallel and aggregate). The sticky helpers do **not** use this -- they go through `@fastify/reply-from`. Reach for `proxyRequest` only when you genuinely need the raw upstream response object (status code, body parser) outside the request/reply pipeline.
-
-- Pulls `req.method` and `req.url` from Fastify (or uses `opts.upstreamPath`).
-- If `req.body` is set, JSON-stringifies it and sets `content-type: application/json`. JSON-only in v1; non-JSON requires `fastify-raw-body` and is out of scope.
-- Applies `opts.timeout` as both `headersTimeout` and `bodyTimeout` on the undici call.
-- Inbound headers are not propagated.
-
-## Metrics
-
-The library does not ship a metrics module. Each preset is responsible for its own counters and gauges -- the label scheme that makes sense for one preset (e.g. Regina's `type` label with values like `chat`, `chat_stream`, `messages`) won't fit another. A typical preset reads `globalThis.platformatic?.prometheus` inside its Fastify plugin, builds the counters/gauges it needs, and feeds them into the helpers via `onResult`:
-
-```ts
-const prom = (globalThis as any).platformatic?.prometheus
-const requestsTotal = prom && new prom.client.Counter({
-  name: 'my_coordinator_requests_total',
-  help: 'Routed requests',
-  labelNames: ['type', 'result'],
-  registers: [prom.registry]
-})
-
-app.post('/things/:id/work', lookupAndProxy(registry, {
-  instanceFrom: req => req.params.id,
-  reassignOrphans: true,
-  onResult: (result) => requestsTotal?.inc({ type: 'work', result })
-}))
-```
-
-A common gauge is `<preset>_pod_count`. Refresh it on a `setInterval`:
-
-```ts
-const podCount = prom && new prom.client.Gauge({
-  name: 'my_coordinator_pod_count', help: 'Registered pod count', registers: [prom.registry]
-})
-const refresh = async () => podCount?.set((await registry.listMembers()).length)
-const interval = setInterval(refresh, 15_000)
-interval.unref()
-refresh()
-app.addHook('onClose', () => clearInterval(interval))
-```
-
-## Writing a preset
-
-A preset is the smallest possible Watt stackable that exposes its API contract using this library. Skeleton:
-
-```ts
-import fp from 'fastify-plugin'
-import replyFrom from '@fastify/reply-from'
-import {
-  Registry,
-  lookupAndProxy, pickAndRegister, lookupAndDeregister
-} from '@platformatic/coordinator'
-
-async function myCoordinatorPlugin (app) {
-  // Watt augments the Fastify instance with `.platformatic`; cast in TS.
-  const config = (app as any).platformatic.config.myCoordinator ?? {}
-
-  // Required: the helpers proxy via reply.from, so register the plugin once.
-  await app.register(replyFrom)
-
-  const registry = new Registry({
-    redis: config.redis,                                  // string from watt.json
-    keyPrefix: 'myservice',                               // YOUR namespace
-    strategy: config.allocationStrategy ?? 'least-loaded',
-    requestTimeout: config.requestTimeout
-  })
-
-  app.addHook('onClose', () => registry.close())
-
-  // (Optional) Wire your own metrics here. See the Metrics section.
-
-  // YOUR routes here -- the API contract you're publishing.
-  const id = req => req.params.instanceId
-  app.post('/instances', pickAndRegister(registry, { registerIdFrom: r => r.instanceId }))
-  app.post('/instances/:instanceId/work', lookupAndProxy(registry, { instanceFrom: id, reassignOrphans: true }))
-  app.delete('/instances/:instanceId', lookupAndDeregister(registry, { instanceFrom: id }))
-}
-
-export const plugin = fp(myCoordinatorPlugin, { name: 'my-coordinator' })
-```
-
-The preset also owns its `schema` (with `$id` for Watt validation) and its `Generator` (for `wattpm create`). See [`@platformatic/regina-coordinator`](https://github.com/platformatic/regina) for a complete example with eleven routes, fan-out aggregation, and a streaming variant.
-
-## Public API
-
-```ts
-export {
-  Registry,
-  Member,
-  RoundRobinStrategy, LeastLoadedStrategy, RandomStrategy, createStrategy,
-  proxyRequest,
-  lookupAndProxy, pickAndRegister, lookupAndDeregister
-}
-
-export type {
-  AllocationStrategy, MemberInfo, MemberWithLoad, ResolveResult,
-  RegistryOptions, MemberOptions, ProxyRequestOptions,
-  LookupAndProxyOptions, LookupAndProxyResult,
-  PickAndRegisterOptions, PickAndRegisterResult,
-  LookupAndDeregisterOptions, LookupAndDeregisterResult
-}
-```
+All three helpers go through `@fastify/reply-from`, which the host application must register once before any helper-backed route is mounted.
 
 ## Testing
 
-Tests use a dedicated Redis on `127.0.0.1:6390` so they don't collide with anything you run on the default port. A `docker-compose.yml` is included.
+Tests use Redis on `127.0.0.1:6390`. A `docker-compose.yml` is included.
 
 ```sh
-pnpm run test:redis:up   # starts redis:7-alpine on 6390 (waits for healthcheck)
+pnpm run test:redis:up
 pnpm test
-pnpm run test:redis:down # stops and removes the container
+pnpm run test:redis:down
 ```
 
-The URL is read from `REDIS_URL` (default `redis://127.0.0.1:6390`), so CI can point tests at any Redis. Tests isolate keys with a random prefix and clean up after themselves.
+The URL is read from `REDIS_URL` (default `redis://127.0.0.1:6390`). Tests isolate keys with a random prefix and clean up after themselves.
 
 ## License
 

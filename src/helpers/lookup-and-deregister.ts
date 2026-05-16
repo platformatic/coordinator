@@ -32,14 +32,16 @@ export function lookupAndDeregister (
     const resolved = await registry.resolveInstance(instanceId)
 
     if (!resolved) {
+      // No live pod for this instance. Distinguish "binding exists but pods dead"
+      // from "instance unknown".
+      const exists = await registry.hasBinding(instanceId)
+      if (exists) {
+        await registry.deregisterInstance(instanceId)
+        onResult?.('deregistered_dead_pod')
+        return reply.code(expectedStatus).send()
+      }
       onResult?.('not_found')
       return reply.code(404).send({ error: notFoundMessage })
-    }
-
-    if (resolved.address === null) {
-      await registry.deregisterInstance(instanceId)
-      onResult?.('deregistered_dead_pod')
-      return reply.code(expectedStatus).send()
     }
 
     const onResponse: FastifyReplyFromHooks['onResponse'] = (_req, replyOut, res) => {
@@ -50,7 +52,7 @@ export function lookupAndDeregister (
             onResult?.('deregistered')
             replyOut.send()
           },
-          (err) => replyOut.send(err)
+          (err: Error) => replyOut.send(err)
         )
       } else {
         onResult?.('upstream_error')
