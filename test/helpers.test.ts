@@ -12,9 +12,9 @@ import { REDIS_URL } from './redis-url.ts'
 
 const PREFIX = `test-${randomBytes(4).toString('hex')}`
 
-function membersKey (): string { return `${PREFIX}:members` }
-function memberKey (id: string): string { return `${PREFIX}:member:${id}` }
-function resourceKey (id: string): string { return `${PREFIX}:instance:${id}` }
+const membersKey = (): string => `${PREFIX}:members`
+const memberKey = (id: string): string => `${PREFIX}:member:${id}`
+const destinationKey = (id: string): string => `${PREFIX}:destination:${id}`
 
 interface MockPod {
   app: ReturnType<typeof Fastify>
@@ -49,7 +49,6 @@ async function createMockPod (): Promise<MockPod> {
   app.post('/resources/:id/heartbeat', async (req, reply) => {
     const { id } = req.params as { id: string }
     if (!resources.has(id)) {
-      // Simulate auto-restore so orphan reassignment can succeed
       resources.set(id, { resourceId: id, status: 'restored' })
     }
     return reply.code(204).send()
@@ -60,7 +59,7 @@ async function createMockPod (): Promise<MockPod> {
   return { app, address: `http://127.0.0.1:${addr.port}`, resources }
 }
 
-async function createCoordinator (registry: Registry) {
+async function createCoordinator (registry: Registry): Promise<ReturnType<typeof Fastify>> {
   const app = Fastify()
   await app.register(replyFrom)
 
@@ -71,20 +70,26 @@ async function createCoordinator (registry: Registry) {
   app.post('/resources/:id/echo',
     { schema: { body: { type: 'object', properties: { msg: { type: 'string' } } } } },
     lookupAndProxy(registry, {
-      instanceFrom: (req: any) => req.params.id,
+      destinationFrom: (req: any) => req.params.id,
       reassignOrphans: true
     }))
 
   app.post('/resources/:id/heartbeat', lookupAndProxy(registry, {
-    instanceFrom: (req: any) => req.params.id,
+    destinationFrom: (req: any) => req.params.id,
     reassignOrphans: true
   }))
 
   app.delete('/resources/:id', lookupAndDeregister(registry, {
-    instanceFrom: (req: any) => req.params.id
+    destinationFrom: (req: any) => req.params.id
   }))
 
   return app
+}
+
+async function makeLivePod (redis: Redis, memberId: string, address: string): Promise<void> {
+  await redis.sadd(membersKey(), memberId)
+  await redis.hset(memberKey(memberId), { address, load: '0' })
+  await redis.expire(memberKey(memberId), 60)
 }
 
 test('Coordinator helpers', async (t) => {
@@ -95,12 +100,10 @@ test('Coordinator helpers', async (t) => {
   const pod1 = await createMockPod()
   const pod2 = await createMockPod()
 
-  await redis.sadd(membersKey(), memberId1)
-  await redis.set(memberKey(memberId1), pod1.address, 'EX', 60)
-  await redis.sadd(membersKey(), memberId2)
-  await redis.set(memberKey(memberId2), pod2.address, 'EX', 60)
+  await makeLivePod(redis, memberId1, pod1.address)
+  await makeLivePod(redis, memberId2, pod2.address)
 
-  const registry = new Registry({ redis: REDIS_URL, keyPrefix: PREFIX })
+  const registry = new Registry({ redis: REDIS_URL, keyPrefix: PREFIX, cache: false })
   const coordinator = await createCoordinator(registry)
 
   t.after(async () => {
@@ -115,19 +118,20 @@ test('Coordinator helpers', async (t) => {
     await redis.quit()
   })
 
-  await t.test('pickAndRegister: spawns and registers in Redis', async () => {
+  await t.test('pickAndRegister: spawns and binds in Redis', async () => {
     const res = await coordinator.inject({ method: 'POST', url: '/resources' })
     strictEqual(res.statusCode, 201)
     const body = res.json() as any
     ok(body.resourceId)
 
-    const memberId = await redis.get(resourceKey(body.resourceId))
-    ok(memberId === memberId1 || memberId === memberId2)
+    const set = await redis.smembers(destinationKey(body.resourceId))
+    strictEqual(set.length, 1)
+    ok(set[0] === memberId1 || set[0] === memberId2)
   })
 
   await t.test('pickAndRegister: returns 503 when no pods are available', async () => {
     const isolatedPrefix = `${PREFIX}-empty-${randomBytes(2).toString('hex')}`
-    const emptyRegistry = new Registry({ redis: REDIS_URL, keyPrefix: isolatedPrefix })
+    const emptyRegistry = new Registry({ redis: REDIS_URL, keyPrefix: isolatedPrefix, cache: false })
     const app = Fastify()
     await app.register(replyFrom)
     app.post('/spawn', pickAndRegister(emptyRegistry, { registerIdFrom: (r: any) => r.id }))
@@ -143,7 +147,7 @@ test('Coordinator helpers', async (t) => {
     }
   })
 
-  await t.test('lookupAndProxy: routes to the registered pod', async () => {
+  await t.test('lookupAndProxy: routes to the bound pod', async () => {
     const spawnRes = await coordinator.inject({ method: 'POST', url: '/resources' })
     const id = (spawnRes.json() as any).resourceId
 
@@ -166,13 +170,12 @@ test('Coordinator helpers', async (t) => {
     })
     strictEqual(res.statusCode, 404)
     const body = res.json() as any
-    strictEqual(body.error, 'Instance not found')
+    strictEqual(body.error, 'Destination not found')
   })
 
   await t.test('lookupAndProxy: reassigns orphan when reassignOrphans is true', async () => {
     const orphanId = `orphan-${randomBytes(3).toString('hex')}`
-    const deadMemberId = 'dead-pod'
-    await redis.set(resourceKey(orphanId), deadMemberId)
+    await redis.sadd(destinationKey(orphanId), 'dead-pod')
 
     const res = await coordinator.inject({
       method: 'POST',
@@ -180,38 +183,33 @@ test('Coordinator helpers', async (t) => {
     })
     strictEqual(res.statusCode, 204)
 
-    const newMember = await redis.get(resourceKey(orphanId))
-    ok(newMember === memberId1 || newMember === memberId2, 'should reassign to a live pod')
+    const set = await redis.smembers(destinationKey(orphanId))
+    strictEqual(set.length, 1)
+    ok(set[0] === memberId1 || set[0] === memberId2, 'reassigned to a live pod')
+    ok(!set.includes('dead-pod'))
   })
 
-  await t.test('lookupAndDeregister: deletes the resource and the registry mapping', async () => {
+  await t.test('lookupAndDeregister: deletes the resource and the destination set', async () => {
     const spawnRes = await coordinator.inject({ method: 'POST', url: '/resources' })
     const id = (spawnRes.json() as any).resourceId
 
-    const delRes = await coordinator.inject({
-      method: 'DELETE',
-      url: `/resources/${id}`
-    })
+    const delRes = await coordinator.inject({ method: 'DELETE', url: `/resources/${id}` })
     strictEqual(delRes.statusCode, 204)
 
-    const mapping = await redis.get(resourceKey(id))
-    strictEqual(mapping, null)
+    const exists = await redis.exists(destinationKey(id))
+    strictEqual(exists, 0)
   })
 
   await t.test('lookupAndDeregister: fast-paths when the pod is dead', async () => {
     const orphanId = `orphan-del-${randomBytes(3).toString('hex')}`
-    const deadMemberId = 'dead-pod'
-    await redis.set(resourceKey(orphanId), deadMemberId)
+    await redis.sadd(destinationKey(orphanId), 'dead-pod')
 
     const totalSpawnsBefore = pod1.resources.size + pod2.resources.size
-    const res = await coordinator.inject({
-      method: 'DELETE',
-      url: `/resources/${orphanId}`
-    })
+    const res = await coordinator.inject({ method: 'DELETE', url: `/resources/${orphanId}` })
     strictEqual(res.statusCode, 204)
 
-    const mapping = await redis.get(resourceKey(orphanId))
-    strictEqual(mapping, null, 'mapping should be removed')
+    const exists = await redis.exists(destinationKey(orphanId))
+    strictEqual(exists, 0, 'set should be removed')
 
     const totalSpawnsAfter = pod1.resources.size + pod2.resources.size
     strictEqual(totalSpawnsAfter, totalSpawnsBefore, 'no proxy call should reach a live pod')

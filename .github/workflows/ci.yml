@@ -22,7 +22,7 @@ jobs:
           --health-retries 5
     strategy:
       matrix:
-        node-version: [22, 24]
+        node-version: [22, 24, 26]
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4

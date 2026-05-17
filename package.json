@@ -1,7 +1,7 @@
 {
   "name": "@platformatic/coordinator",
-  "version": "0.1.3",
-  "description": "Sticky-resource coordinator: Redis-backed registry, allocation strategies, and Fastify route helpers for multi-pod services",
+  "version": "0.2.0",
+  "description": "Multi-pod destination routing for stateful tiers: Valkey-backed registry with hash member records, set-based destinations, lock routing, and allocation strategies",
   "homepage": "https://github.com/platformatic/coordinator",
   "author": "Platformatic Inc. <oss@platformatic.dev> (https://platformatic.dev)",
   "license": "Apache-2.0",
@@ -11,7 +11,7 @@
   },
   "private": false,
   "publishConfig": {
-    "access": "restricted"
+    "access": "public"
   },
   "files": [
     "dist",

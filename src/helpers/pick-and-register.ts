@@ -47,12 +47,12 @@ export function pickAndRegister (
 
         if (res.statusCode === expectedStatus) {
           const id = registerIdFrom(body)
-          registry.registerInstance(id, member.memberId).then(
+          registry.addPodToDestination(id, member.memberId).then(
             () => {
               onResult?.('spawned')
               replyOut.send(body)
             },
-            (err) => replyOut.send(err)
+            (err: Error) => replyOut.send(err)
           )
         } else {
           onResult?.('upstream_error')

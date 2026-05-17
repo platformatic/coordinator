@@ -1,5 +1,5 @@
 export { Registry } from './registry.ts'
-export type { RegistryOptions, MemberInfo, ResolveResult } from './registry.ts'
+export type { RegistryOptions, ResolveResult, ResolveLockResult } from './registry.ts'
 
 export { Member } from './member.ts'
 export type { MemberOptions } from './member.ts'
@@ -10,7 +10,10 @@ export {
   RandomStrategy,
   createStrategy
 } from './strategies.ts'
-export type { AllocationStrategy, MemberWithLoad } from './strategies.ts'
+export type { AllocationStrategy, MemberInfo, PickContext } from './strategies.ts'
+
+export { TTLCache } from './cache.ts'
+export type { CacheOptions } from './cache.ts'
 
 export { proxyRequest } from './proxy-request.ts'
 export type { ProxyRequestOptions } from './proxy-request.ts'

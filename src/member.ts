@@ -1,4 +1,5 @@
 import { Redis } from 'iovalkey'
+import type { MemberInfo } from './strategies.ts'
 
 export interface MemberOptions {
   redis: string
@@ -6,6 +7,7 @@ export interface MemberOptions {
   address: string
   keyPrefix?: string
   ttl?: number
+  getLoad?: () => number
 }
 
 export class Member {
@@ -14,6 +16,7 @@ export class Member {
   #address: string
   #keyPrefix: string
   #ttl: number
+  #getLoad: () => number
 
   constructor (opts: MemberOptions) {
     this.#redis = new Redis(opts.redis)
@@ -21,6 +24,7 @@ export class Member {
     this.#address = opts.address
     this.#keyPrefix = opts.keyPrefix ?? 'coordinator'
     this.#ttl = opts.ttl ?? 30
+    this.#getLoad = opts.getLoad ?? (() => 0)
   }
 
   get memberId (): string {
@@ -35,48 +39,88 @@ export class Member {
     return `${this.#keyPrefix}:members`
   }
 
-  #memberKey (): string {
-    return `${this.#keyPrefix}:member:${this.#memberId}`
+  #memberKey (memberId: string = this.#memberId): string {
+    return `${this.#keyPrefix}:member:${memberId}`
   }
 
-  #instanceKey (instanceId: string): string {
-    return `${this.#keyPrefix}:instance:${instanceId}`
+  #destinationKey (destId: string): string {
+    return `${this.#keyPrefix}:destination:${destId}`
   }
 
-  #memberLoadKey (): string {
-    return `${this.#keyPrefix}:member:${this.#memberId}:instances`
+  #lockKey (lockId: string): string {
+    return `${this.#keyPrefix}:lock:${lockId}`
   }
 
   async register (): Promise<void> {
-    await this.#redis.sadd(this.#membersKey(), this.#memberId)
-    await this.#redis.set(this.#memberKey(), this.#address, 'EX', this.#ttl)
-    await this.#redis.set(this.#memberLoadKey(), '0', 'EX', this.#ttl)
-  }
-
-  async deregister (): Promise<void> {
-    await this.#redis.srem(this.#membersKey(), this.#memberId)
-    await this.#redis.del(this.#memberKey(), this.#memberLoadKey())
+    const pipeline = this.#redis.pipeline()
+    pipeline.sadd(this.#membersKey(), this.#memberId)
+    pipeline.hset(this.#memberKey(), {
+      address: this.#address,
+      load: String(this.#getLoad())
+    })
+    pipeline.expire(this.#memberKey(), this.#ttl)
+    await pipeline.exec()
   }
 
   async heartbeat (): Promise<void> {
-    await this.#redis.expire(this.#memberKey(), this.#ttl)
-    await this.#redis.expire(this.#memberLoadKey(), this.#ttl)
+    const pipeline = this.#redis.pipeline()
+    pipeline.hset(this.#memberKey(), 'load', String(this.#getLoad()))
+    pipeline.expire(this.#memberKey(), this.#ttl)
+    await pipeline.exec()
   }
 
-  async registerInstance (instanceId: string): Promise<void> {
-    await this.#redis.set(this.#instanceKey(instanceId), this.#memberId)
-    await this.#redis.incr(this.#memberLoadKey())
+  async deregister (): Promise<void> {
+    const pipeline = this.#redis.pipeline()
+    pipeline.srem(this.#membersKey(), this.#memberId)
+    pipeline.del(this.#memberKey())
+    await pipeline.exec()
   }
 
-  async deregisterInstance (instanceId: string): Promise<void> {
-    await this.#redis.del(this.#instanceKey(instanceId))
-    await this.#redis.decr(this.#memberLoadKey())
+  async addToDestination (destinationId: string): Promise<void> {
+    await this.#redis.sadd(this.#destinationKey(destinationId), this.#memberId)
   }
 
-  async lookupInstance (instanceId: string): Promise<string | null> {
-    const memberId = await this.#redis.get(this.#instanceKey(instanceId))
-    if (!memberId) return null
-    return this.#redis.get(`${this.#keyPrefix}:member:${memberId}`)
+  async removeFromDestination (destinationId: string): Promise<void> {
+    await this.#redis.srem(this.#destinationKey(destinationId), this.#memberId)
+  }
+
+  async registerLock (
+    lockId: string,
+    destinationId: string,
+    metadata: Record<string, string> = {}
+  ): Promise<void> {
+    await this.#redis.hset(this.#lockKey(lockId), {
+      podId: this.#memberId,
+      destinationId,
+      ...metadata
+    })
+  }
+
+  async unregisterLock (lockId: string): Promise<void> {
+    await this.#redis.del(this.#lockKey(lockId))
+  }
+
+  async listPeerLoad (): Promise<MemberInfo[]> {
+    const memberIds = await this.#redis.smembers(this.#membersKey())
+    if (memberIds.length === 0) return []
+
+    const pipeline = this.#redis.pipeline()
+    for (const id of memberIds) {
+      pipeline.hmget(this.#memberKey(id), 'address', 'load')
+    }
+    const results = await pipeline.exec()
+    if (!results) return []
+
+    const live: MemberInfo[] = []
+    for (let i = 0; i < memberIds.length; i++) {
+      const [err, fields] = results[i] as [Error | null, (string | null)[] | null]
+      if (err || !fields) continue
+      const address = fields[0]
+      if (!address) continue
+      const load = parseInt(fields[1] ?? '0', 10) || 0
+      live.push({ memberId: memberIds[i], address, load })
+    }
+    return live
   }
 
   async close (): Promise<void> {

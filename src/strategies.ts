@@ -1,20 +1,24 @@
-export interface MemberWithLoad {
+export interface MemberInfo {
   memberId: string
   address: string
-  instanceCount: number
+  load: number
+}
+
+export interface PickContext {
+  destinationId?: string
 }
 
 export interface AllocationStrategy {
-  pick (members: MemberWithLoad[]): MemberWithLoad | null
+  pick (candidates: MemberInfo[], ctx: PickContext): MemberInfo | null
 }
 
 export class RoundRobinStrategy implements AllocationStrategy {
   #index = 0
 
-  pick (members: MemberWithLoad[]): MemberWithLoad | null {
-    if (members.length === 0) return null
-    const member = members[this.#index % members.length]
-    this.#index = (this.#index + 1) % members.length
+  pick (candidates: MemberInfo[], _ctx: PickContext): MemberInfo | null {
+    if (candidates.length === 0) return null
+    const member = candidates[this.#index % candidates.length]
+    this.#index = (this.#index + 1) % candidates.length
     return member
   }
 }
@@ -22,20 +26,20 @@ export class RoundRobinStrategy implements AllocationStrategy {
 export class LeastLoadedStrategy implements AllocationStrategy {
   #tieBreaker = 0
 
-  pick (members: MemberWithLoad[]): MemberWithLoad | null {
-    if (members.length === 0) return null
-    const minCount = Math.min(...members.map(m => m.instanceCount))
-    const candidates = members.filter(m => m.instanceCount === minCount)
-    const member = candidates[this.#tieBreaker % candidates.length]
-    this.#tieBreaker = (this.#tieBreaker + 1) % candidates.length
+  pick (candidates: MemberInfo[], _ctx: PickContext): MemberInfo | null {
+    if (candidates.length === 0) return null
+    const min = Math.min(...candidates.map(m => m.load))
+    const tied = candidates.filter(m => m.load === min)
+    const member = tied[this.#tieBreaker % tied.length]
+    this.#tieBreaker = (this.#tieBreaker + 1) % tied.length
     return member
   }
 }
 
 export class RandomStrategy implements AllocationStrategy {
-  pick (members: MemberWithLoad[]): MemberWithLoad | null {
-    if (members.length === 0) return null
-    return members[Math.floor(Math.random() * members.length)]
+  pick (candidates: MemberInfo[], _ctx: PickContext): MemberInfo | null {
+    if (candidates.length === 0) return null
+    return candidates[Math.floor(Math.random() * candidates.length)]
   }
 }
 

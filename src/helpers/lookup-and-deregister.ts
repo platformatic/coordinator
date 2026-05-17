@@ -10,7 +10,7 @@ export type LookupAndDeregisterResult =
   | 'upstream_error'
 
 export interface LookupAndDeregisterOptions {
-  instanceFrom: (req: FastifyRequest) => string
+  destinationFrom: (req: FastifyRequest) => string
   expectedStatus?: number
   notFoundMessage?: string
   onResult?: (result: LookupAndDeregisterResult) => void
@@ -21,36 +21,38 @@ export function lookupAndDeregister (
   opts: LookupAndDeregisterOptions
 ): RouteHandlerMethod {
   const {
-    instanceFrom,
+    destinationFrom,
     expectedStatus = 204,
-    notFoundMessage = 'Instance not found',
+    notFoundMessage = 'Destination not found',
     onResult
   } = opts
 
   return async function (request: FastifyRequest, reply: FastifyReply) {
-    const instanceId = instanceFrom(request)
-    const resolved = await registry.resolveInstance(instanceId)
+    const destinationId = destinationFrom(request)
+    const resolved = await registry.resolveDestination(destinationId)
 
     if (!resolved) {
+      // No live pod for this destination. Distinguish "binding exists but pods dead"
+      // from "destination unknown".
+      const exists = await registry.hasBinding(destinationId)
+      if (exists) {
+        await registry.deregisterDestination(destinationId)
+        onResult?.('deregistered_dead_pod')
+        return reply.code(expectedStatus).send()
+      }
       onResult?.('not_found')
       return reply.code(404).send({ error: notFoundMessage })
-    }
-
-    if (resolved.address === null) {
-      await registry.deregisterInstance(instanceId)
-      onResult?.('deregistered_dead_pod')
-      return reply.code(expectedStatus).send()
     }
 
     const onResponse: FastifyReplyFromHooks['onResponse'] = (_req, replyOut, res) => {
       if (res.statusCode === expectedStatus) {
         res.stream.resume()
-        registry.deregisterInstance(instanceId).then(
+        registry.deregisterDestination(destinationId).then(
           () => {
             onResult?.('deregistered')
             replyOut.send()
           },
-          (err) => replyOut.send(err)
+          (err: Error) => replyOut.send(err)
         )
       } else {
         onResult?.('upstream_error')
