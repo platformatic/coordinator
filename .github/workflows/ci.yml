@@ -79,6 +79,37 @@ jobs:
       - run: pnpm install
       - run: pnpm run test:e2e
 
+  docker-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bring up storage-db stack
+        working-directory: examples/storage-db
+        run: docker compose up --build -d --wait
+      - name: Wait for coordinator to be ready
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8080/pods > /dev/null; then
+              echo "coordinator ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "coordinator did not become ready in 30s"
+          docker compose -f examples/storage-db/docker-compose.yml logs
+          exit 1
+      - name: Run smoke script
+        working-directory: examples/storage-db
+        run: ./scripts/smoke.sh
+      - name: Dump logs on failure
+        if: failure()
+        working-directory: examples/storage-db
+        run: docker compose logs
+      - name: Tear down
+        if: always()
+        working-directory: examples/storage-db
+        run: docker compose down -v
+
   lint:
     runs-on: ubuntu-latest
     steps:

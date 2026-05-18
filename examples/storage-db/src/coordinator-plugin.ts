@@ -5,10 +5,12 @@ import {
   Registry,
   lookupAndProxy,
   pickAndRegister,
-  lookupAndDeregister
+  lookupAndDeregister,
+  lookupLockAndProxy
 } from '@platformatic/coordinator'
 
 interface TenantParams { tenantId: string }
+interface LockParams { lockId: string }
 
 export interface CoordinatorOptions {
   registry: Registry
@@ -30,6 +32,25 @@ const tenantKeySchema = {
       key: { type: 'string', minLength: 1, maxLength: 256 }
     },
     required: ['tenantId', 'key']
+  }
+} as const
+
+const lockSchema = {
+  params: {
+    type: 'object',
+    properties: { lockId: { type: 'string', minLength: 1, maxLength: 128 } },
+    required: ['lockId']
+  }
+} as const
+
+const lockKeySchema = {
+  params: {
+    type: 'object',
+    properties: {
+      lockId: { type: 'string', minLength: 1, maxLength: 128 },
+      key: { type: 'string', minLength: 1, maxLength: 256 }
+    },
+    required: ['lockId', 'key']
   }
 } as const
 
@@ -65,6 +86,21 @@ async function coordinatorRoutes (app: FastifyInstance, opts: CoordinatorOptions
     destinationFrom: tenantFrom,
     notFoundMessage: 'tenant not found'
   }))
+
+  app.post('/tenants/:tenantId/transactions',
+    { schema: tenantSchema },
+    lookupAndProxy(registry, proxyOpts))
+
+  const lockFrom = (req: FastifyRequest): string => (req.params as LockParams).lockId
+  const lockProxy = lookupLockAndProxy(registry, {
+    lockFrom,
+    notFoundMessage: 'transaction not found'
+  })
+
+  app.put('/transactions/:lockId/keys/:key', { schema: lockKeySchema }, lockProxy)
+  app.get('/transactions/:lockId/keys/:key', { schema: lockKeySchema }, lockProxy)
+  app.post('/transactions/:lockId/commit', { schema: lockSchema }, lockProxy)
+  app.post('/transactions/:lockId/rollback', { schema: lockSchema }, lockProxy)
 }
 
 export const coordinatorPlugin = fp(coordinatorRoutes, { name: 'storage-db-coordinator' })

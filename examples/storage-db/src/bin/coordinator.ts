@@ -13,8 +13,14 @@ const host = process.env.HOST ?? '0.0.0.0'
 const redisUrl = env('REDIS_URL')
 const keyPrefix = process.env.KEY_PREFIX ?? 'storage-db'
 const strategy = (process.env.STRATEGY ?? 'least-loaded') as 'round-robin' | 'least-loaded' | 'random'
+const cacheTtlMs = process.env.CACHE_TTL_MS ? Number(process.env.CACHE_TTL_MS) : undefined
 
-const registry = new Registry({ redis: redisUrl, keyPrefix, strategy })
+const registry = new Registry({
+  redis: redisUrl,
+  keyPrefix,
+  strategy,
+  cache: cacheTtlMs !== undefined ? { ttl: cacheTtlMs } : undefined
+})
 
 const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' } })
 await app.register(coordinatorPlugin, { registry })

@@ -1,6 +1,7 @@
-import type { FastifyRequest, FastifyReply, RouteHandlerMethod } from 'fastify'
+import type { FastifyRequest, RouteHandlerMethod } from 'fastify'
 import '@fastify/reply-from'
 import type { Registry } from '../registry.ts'
+import { proxyVia } from './proxy-via.ts'
 
 export type LookupAndProxyResult = 'hit' | 'orphan_reassigned' | 'not_found'
 
@@ -24,16 +25,14 @@ export function lookupAndProxy (
     onResult
   } = opts
 
-  return async function (request: FastifyRequest, reply: FastifyReply) {
+  return proxyVia(async (request) => {
     const destinationId = destinationFrom(request)
     const resolved = await registry.resolveDestination(destinationId, { reassignOrphans, claimOnMiss })
-
     if (!resolved) {
       onResult?.('not_found')
-      return reply.code(404).send({ error: notFoundMessage })
+      return null
     }
-
     onResult?.(resolved.reassigned ? 'orphan_reassigned' : 'hit')
-    return reply.from(`${resolved.address}${request.url}`)
-  }
+    return resolved
+  }, { notFoundMessage })
 }

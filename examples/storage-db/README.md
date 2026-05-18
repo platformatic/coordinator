@@ -27,6 +27,8 @@ Then in a second terminal:
 
 You should see five tenants get spread across the three pods (default strategy is `least-loaded`), and reads come back tagged with the `memberId` of the pod that served them.
 
+For step-by-step instructions on driving the stack manually (curl examples, transactions, Valkey/Postgres inspection), see [MANUAL_TESTING.md](./MANUAL_TESTING.md).
+
 ## API (via the coordinator at `:8080`)
 
 | Method | Path | What it does |

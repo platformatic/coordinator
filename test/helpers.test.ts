@@ -8,6 +8,7 @@ import { Registry } from '../src/registry.ts'
 import { lookupAndProxy } from '../src/helpers/lookup-and-proxy.ts'
 import { pickAndRegister } from '../src/helpers/pick-and-register.ts'
 import { lookupAndDeregister } from '../src/helpers/lookup-and-deregister.ts'
+import { lookupLockAndProxy } from '../src/helpers/lookup-lock-and-proxy.ts'
 import { REDIS_URL } from './redis-url.ts'
 
 const PREFIX = `test-${randomBytes(4).toString('hex')}`
@@ -15,6 +16,7 @@ const PREFIX = `test-${randomBytes(4).toString('hex')}`
 const membersKey = (): string => `${PREFIX}:members`
 const memberKey = (id: string): string => `${PREFIX}:member:${id}`
 const destinationKey = (id: string): string => `${PREFIX}:destination:${id}`
+const lockKey = (id: string): string => `${PREFIX}:lock:${id}`
 
 interface MockPod {
   app: ReturnType<typeof Fastify>
@@ -54,6 +56,11 @@ async function createMockPod (): Promise<MockPod> {
     return reply.code(204).send()
   })
 
+  app.post('/locks/:lockId/echo', async (req, reply) => {
+    const { lockId } = req.params as { lockId: string }
+    return reply.code(200).send({ lockId, body: req.body })
+  })
+
   await app.listen({ port: 0, host: '127.0.0.1' })
   const addr = app.server.address() as any
   return { app, address: `http://127.0.0.1:${addr.port}`, resources }
@@ -82,6 +89,12 @@ async function createCoordinator (registry: Registry): Promise<ReturnType<typeof
   app.delete('/resources/:id', lookupAndDeregister(registry, {
     destinationFrom: (req: any) => req.params.id
   }))
+
+  app.post('/locks/:lockId/echo',
+    { schema: { body: { type: 'object', properties: { msg: { type: 'string' } } } } },
+    lookupLockAndProxy(registry, {
+      lockFrom: (req: any) => req.params.lockId
+    }))
 
   return app
 }
@@ -217,6 +230,44 @@ test('Coordinator helpers', async (t) => {
 
   await t.test('lookupAndDeregister: returns 404 when resource is unknown', async () => {
     const res = await coordinator.inject({ method: 'DELETE', url: '/resources/never-existed' })
+    strictEqual(res.statusCode, 404)
+  })
+
+  await t.test('lookupLockAndProxy: routes to the pod that owns the lock', async () => {
+    const lockId = `lock-${randomBytes(3).toString('hex')}`
+    await redis.hset(lockKey(lockId), { podId: memberId2, destinationId: 'unused' })
+
+    const res = await coordinator.inject({
+      method: 'POST',
+      url: `/locks/${lockId}/echo`,
+      payload: { msg: 'pinned' }
+    })
+    strictEqual(res.statusCode, 200)
+    const body = res.json() as any
+    strictEqual(body.lockId, lockId)
+    strictEqual(body.body.msg, 'pinned')
+  })
+
+  await t.test('lookupLockAndProxy: returns 404 for unknown lock', async () => {
+    const res = await coordinator.inject({
+      method: 'POST',
+      url: '/locks/never-existed/echo',
+      payload: { msg: 'x' }
+    })
+    strictEqual(res.statusCode, 404)
+    const body = res.json() as any
+    strictEqual(body.error, 'Lock not found')
+  })
+
+  await t.test('lookupLockAndProxy: returns 404 when the owning pod is dead', async () => {
+    const lockId = `lock-dead-${randomBytes(3).toString('hex')}`
+    await redis.hset(lockKey(lockId), { podId: 'dead-pod', destinationId: 'unused' })
+
+    const res = await coordinator.inject({
+      method: 'POST',
+      url: `/locks/${lockId}/echo`,
+      payload: { msg: 'x' }
+    })
     strictEqual(res.statusCode, 404)
   })
 })

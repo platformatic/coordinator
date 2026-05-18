@@ -15,6 +15,7 @@ RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
 COPY src ./src
 COPY tsconfig.json ./
 COPY examples/storage-db/src examples/storage-db/src
+COPY examples/storage-db/migrations examples/storage-db/migrations
 COPY examples/storage-db/tsconfig.json examples/storage-db/
 
 RUN pnpm --filter @platformatic/coordinator run build

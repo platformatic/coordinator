@@ -21,9 +21,6 @@ const memberTtl = process.env.MEMBER_TTL ? Number(process.env.MEMBER_TTL) : unde
 
 const pools = new PoolManager({ connectionString: pgUrl })
 
-const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' } })
-await app.register(podPlugin, { pools, memberId })
-
 const member = new Member({
   redis: redisUrl,
   memberId,
@@ -32,6 +29,9 @@ const member = new Member({
   ttl: memberTtl,
   getLoad: () => pools.load()
 })
+
+const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' } })
+await app.register(podPlugin, { pools, member, memberId })
 
 await member.register()
 app.log.info({ memberId, memberAddress }, 'registered in member registry')
