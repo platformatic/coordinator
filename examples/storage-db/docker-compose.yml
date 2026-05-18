@@ -1,0 +1,71 @@
+services:
+  valkey:
+    image: valkey/valkey:8
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  postgres:
+    image: postgres:17-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: storage
+      POSTGRES_PASSWORD: storage
+      POSTGRES_DB: storage
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U storage -d storage"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  coordinator:
+    build:
+      context: ../..
+      dockerfile: examples/storage-db/Dockerfile
+    command: ["node", "src/bin/coordinator.ts"]
+    environment:
+      PORT: "8080"
+      REDIS_URL: redis://valkey:6379
+      KEY_PREFIX: storage-db
+      STRATEGY: least-loaded
+      LOG_LEVEL: info
+    depends_on:
+      valkey: { condition: service_healthy }
+    ports:
+      - "8080:8080"
+
+  pod1: &pod
+    build:
+      context: ../..
+      dockerfile: examples/storage-db/Dockerfile
+    command: ["node", "src/bin/pod.ts"]
+    environment: &pod-env
+      PORT: "3000"
+      REDIS_URL: redis://valkey:6379
+      KEY_PREFIX: storage-db
+      MEMBER_ID: pod1
+      MEMBER_ADDRESS: http://pod1:3000
+      PG_URL: postgresql://storage:storage@postgres:5432/storage
+      LOG_LEVEL: info
+    depends_on:
+      valkey: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+
+  pod2:
+    <<: *pod
+    environment:
+      <<: *pod-env
+      MEMBER_ID: pod2
+      MEMBER_ADDRESS: http://pod2:3000
+
+  pod3:
+    <<: *pod
+    environment:
+      <<: *pod-env
+      MEMBER_ID: pod3
+      MEMBER_ADDRESS: http://pod3:3000

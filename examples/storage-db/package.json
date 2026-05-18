@@ -1,0 +1,31 @@
+{
+  "name": "@platformatic/storage-db",
+  "version": "0.1.0",
+  "description": "Multi-tenant per-pod Postgres proxy. Reference headless service for the @platformatic/coordinator pattern",
+  "author": "Platformatic Inc. <oss@platformatic.dev> (https://platformatic.dev)",
+  "license": "Apache-2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start:pod": "node src/bin/pod.ts",
+    "start:coordinator": "node src/bin/coordinator.ts",
+    "compose:up": "docker compose up --build",
+    "compose:down": "docker compose down -v",
+    "smoke": "./scripts/smoke.sh"
+  },
+  "dependencies": {
+    "@fastify/reply-from": "^12.6.2",
+    "@platformatic/coordinator": "workspace:*",
+    "fastify": "^5.3.2",
+    "fastify-plugin": "^5.0.1",
+    "pg": "^8.13.1",
+    "postgrator": "^8.0.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.11.10"
+  },
+  "engines": {
+    "node": ">= 22.18.0"
+  }
+}

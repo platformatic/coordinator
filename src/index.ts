@@ -26,3 +26,9 @@ export type { PickAndRegisterOptions, PickAndRegisterResult } from './helpers/pi
 
 export { lookupAndDeregister } from './helpers/lookup-and-deregister.ts'
 export type { LookupAndDeregisterOptions, LookupAndDeregisterResult } from './helpers/lookup-and-deregister.ts'
+
+export { lookupLockAndProxy } from './helpers/lookup-lock-and-proxy.ts'
+export type { LookupLockAndProxyOptions, LookupLockAndProxyResult } from './helpers/lookup-lock-and-proxy.ts'
+
+export { proxyVia } from './helpers/proxy-via.ts'
+export type { ProxyViaOptions, ProxyResolver, ProxyTarget } from './helpers/proxy-via.ts'
