@@ -130,6 +130,22 @@ test('GET /pods returns the three live pods', async () => {
   assert.deepEqual(ids, [...POD_IDS].sort())
 })
 
+// Runs first among the POST tests so every pod still reports load=0 in Valkey.
+// Once any tenant is created and its heartbeat fires (~500ms), the strategy
+// would correctly pack new tenants on the remaining cold pod(s) instead of
+// distributing - that is the documented behaviour of least-loaded.
+test('least-loaded: on cold start, six POSTs distribute across all three pods', async () => {
+  const tenantNames = ['cold-1', 'cold-2', 'cold-3', 'cold-4', 'cold-5', 'cold-6']
+  const owners: string[] = []
+  for (const t of tenantNames) {
+    const res = await fetch(`${COORDINATOR_URL}/tenants/${t}`, { method: 'POST' })
+    const body = await res.json() as { memberId: string }
+    owners.push(body.memberId)
+  }
+  const unique = new Set(owners)
+  assert.equal(unique.size, 3, `expected all 3 pods to be picked, got ${[...unique].join(',')}`)
+})
+
 test('POST /tenants/:id picks a pod, binds it, returns the memberId', async () => {
   const res = await fetch(`${COORDINATOR_URL}/tenants/alpha`, { method: 'POST' })
   assert.equal(res.status, 201)
@@ -154,18 +170,6 @@ test('PUT then GET round-trips through the same pod', async () => {
   const body = await get.json() as { value: string, memberId: string }
   assert.equal(body.value, 'world')
   assert.equal(body.memberId, ownerId)
-})
-
-test('least-loaded spreads new tenants across pods', async () => {
-  const tenantNames = ['t1', 't2', 't3', 't4', 't5', 't6']
-  const owners: string[] = []
-  for (const t of tenantNames) {
-    const res = await fetch(`${COORDINATOR_URL}/tenants/${t}`, { method: 'POST' })
-    const body = await res.json() as { memberId: string }
-    owners.push(body.memberId)
-  }
-  const unique = new Set(owners)
-  assert.ok(unique.size >= 2, `expected >=2 distinct pods, got ${[...unique].join(',')}`)
 })
 
 test('postgres state: migrations ran and writes land in the tenant schema', async () => {
