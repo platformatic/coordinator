@@ -231,14 +231,56 @@ The coordinator picks among a destination's pod set on the request path using th
 
 Reducing fan-out (removing a pod from a destination's set when load drops) is not a runtime concern. It is an operator action or a slow background reconciler; running it from the data path risks thrash under bursty load.
 
-## Why Kubernetes
+## Platform requirements
 
-The architecture leans on two K8s features that some other platforms (ECS, plain VM fleets) do not directly provide:
+The pattern is platform-neutral. It runs anywhere these three properties hold:
 
-- **Headless Services**: the coordinator addresses resource pods by pod IP, read from Valkey. Platforms that route traffic through load balancers or DNS service discovery typically do not expose a stable per-pod endpoint for the coordinator to dial directly.
-- **Stable pod identity** (StatefulSet-style): the identity registered into Valkey is the pod's K8s identity. Ephemeral task IPs force the heartbeat path to do more work after every restart.
+1. **Each resource pod has a dialable address.** A scheme + host + port the coordinator can open a TCP connection to. Host can be a per-pod DNS name (Kubernetes Headless Service), a per-task IP (ECS `awsvpc` ENI, Nomad alloc IP), or any other stable-enough endpoint.
+2. **Each resource pod can compute its own address at startup** and write it into Valkey. The pod tells the registry where it is; the registry is the discovery layer.
+3. **The coordinator and all resource pods can reach Valkey** and can open TCP connections to the addresses they read from it.
 
-The in-process co-location of caller and coordinator inside one process is a separate constraint and works on either platform. ECS can be made to work with Cloud Map for service discovery and a custom registration path, but at meaningful cost to operational simplicity.
+Nothing in `@platformatic/coordinator` calls a Kubernetes API, parses downward-API files, or relies on K8s-specific behavior. The library is Valkey + HTTP + a `memberAddress` string.
+
+### Kubernetes
+
+The natural fit. A `StatefulSet` + Headless Service gives each pod a predictable DNS name like `pod-0.svc.namespace.svc.cluster.local`, and the downward API composes that into an env var:
+
+```yaml
+env:
+  - name: POD_NAME
+    valueFrom: { fieldRef: { fieldPath: metadata.name } }
+  - name: MEMBER_ADDRESS
+    value: "http://$(POD_NAME).svc.namespace.svc.cluster.local:3000"
+```
+
+The pod reads `MEMBER_ADDRESS` from config and passes it to `Member`.
+
+### ECS / Fargate
+
+Each task in `awsvpc` mode gets its own ENI with a private VPC IP. The task fetches that IP from the ECS task metadata endpoint at startup, composes its address, and self-registers. A minimal entrypoint:
+
+```sh
+#!/bin/sh
+IP=$(wget -qO- "${ECS_CONTAINER_METADATA_URI_V4}/task" \
+     | jq -r '.Containers[0].Networks[0].IPv4Addresses[0]')
+export MEMBER_ADDRESS="http://${IP}:3000"
+exec node start.js
+```
+
+The coordinator dials the IP directly, so Cloud Map and ALBs are not in the path. Two Fargate tasks in the same VPC can reach each other given a permissive intra-SG rule. Task IDs are random rather than ordinal, but the library does not care: `memberId` is opaque.
+
+### Nomad, plain VMs, Docker Compose, local dev
+
+Same shape. Each instance discovers its own address (alloc IP, instance metadata, container name, `localhost:<port>`), exports it as `MEMBER_ADDRESS`, and registers. The `storage-db` example in this repo runs on plain Docker Compose with explicit per-pod hostnames and is identical, code-wise, to a Fargate or Kubernetes deployment.
+
+### What you give up off-Kubernetes
+
+The two ergonomic conveniences that K8s provides without effort:
+
+- **Ordinal pod names.** Kubernetes `StatefulSet` gives you stable, human-friendly identifiers like `pod-0`, `pod-1`. ECS and most schedulers give you random IDs. This is a debugging convenience, not a functional requirement.
+- **Stable DNS.** K8s Headless Service publishes per-pod DNS names that survive across IP changes. On ECS the address is the task IP, which changes on restart. Both are fine for the coordinator pattern because the registry is the source of truth, but K8s gives you a second source for free.
+
+Neither shortfall changes the protocol or the code. They affect the deployment glue around the library.
 
 ## Scaling
 

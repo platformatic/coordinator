@@ -23,7 +23,8 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "test": "node --experimental-strip-types --test --test-reporter=cleaner-spec-reporter test/*.test.ts",
+    "test": "node --test --test-reporter=cleaner-spec-reporter test/*.test.ts",
+    "test:e2e": "pnpm --filter @platformatic/coordinator run build && node --test --test-reporter=cleaner-spec-reporter --test-timeout=60000 test/e2e/*.test.ts",
     "test:redis:up": "docker compose up -d --wait",
     "test:redis:down": "docker compose down -v",
     "lint": "eslint --cache"
@@ -38,10 +39,12 @@
   },
   "devDependencies": {
     "@types/node": "^25.5.2",
+    "@types/pg": "^8.11.10",
     "cleaner-spec-reporter": "^1.0.3",
     "eslint": "^9.39.4",
     "fastify": "^5.3.2",
-    "neostandard": "^0.13.0"
+    "neostandard": "^0.13.0",
+    "pg": "^8.13.1"
   },
   "engines": {
     "node": ">= 22.18.0"
