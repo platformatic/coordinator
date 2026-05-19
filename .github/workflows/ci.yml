@@ -88,16 +88,17 @@ jobs:
       - name: Bring up storage-db stack
         working-directory: examples/storage-db
         run: docker compose up --build -d --wait
-      - name: Wait for coordinator to be ready
+      - name: Wait for coordinator + 3 live pods
         run: |
-          for i in $(seq 1 30); do
-            if curl -sf http://127.0.0.1:8080/pods > /dev/null; then
-              echo "coordinator ready after ${i}s"
+          for i in $(seq 1 60); do
+            count=$(curl -sf http://127.0.0.1:8080/pods 2>/dev/null | jq -r '.count // 0')
+            if [ "${count:-0}" -ge 3 ]; then
+              echo "coordinator + 3 pods ready after ${i}s"
               exit 0
             fi
             sleep 1
           done
-          echo "coordinator did not become ready in 30s"
+          echo "coordinator + pods did not become ready in 60s (count=${count:-?})"
           docker compose -f examples/storage-db/docker-compose.yml logs
           exit 1
       - name: Run smoke script
