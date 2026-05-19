@@ -15,7 +15,6 @@
     "smoke": "./scripts/smoke.sh"
   },
   "dependencies": {
-    "@fastify/reply-from": "^12.6.2",
     "@platformatic/coordinator": "workspace:*",
     "fastify": "^5.3.2",
     "fastify-plugin": "^5.0.1",

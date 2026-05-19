@@ -24,13 +24,69 @@ This library handles all of that:
 npm install @platformatic/coordinator
 ```
 
-For the Fastify helpers, also:
+Peer dependency: `fastify >= 5` when using the Fastify plugin or helpers. `@fastify/reply-from` is a runtime dependency of this package — you don't need to install it separately.
 
-```sh
-npm install @fastify/reply-from
+## Quick start (Fastify plugin)
+
+```ts
+import Fastify from 'fastify'
+import coordinatorPlugin from '@platformatic/coordinator'
+
+const app = Fastify()
+
+await app.register(coordinatorPlugin, {
+  redis: 'redis://valkey:6379',
+  keyPrefix: 'myservice',
+  strategy: 'least-loaded'
+})
+
+app.get('/destinations/:id/work', app.coordinator.lookupAndProxy({
+  destinationFrom: req => req.params.id,
+  claimOnMiss: true,
+  reassignOrphans: true
+}))
+
+app.post('/destinations', app.coordinator.pickAndRegister({
+  registerIdFrom: res => res.id
+}))
+
+app.delete('/destinations/:id', app.coordinator.lookupAndDeregister({
+  destinationFrom: req => req.params.id
+}))
+
+app.post('/transactions/:lockId/work', app.coordinator.lookupLockAndProxy({
+  lockFrom: req => req.params.lockId
+}))
+
+await app.listen({ port: 3000 })
 ```
 
-Peer dependency: `fastify >= 5` when using the Fastify helpers.
+The plugin:
+
+- Registers `@fastify/reply-from` (idempotently — skipped if already registered)
+- Constructs a `Registry` from the passed options (or reuses one you provide via `registry`)
+- Exposes both the registry and the route-handler-factory helpers on `app.coordinator`
+- Closes the registry on `app.close()` (unless you brought your own)
+
+Options:
+
+```ts
+interface CoordinatorPluginOptions {
+  // Forwarded to new Registry(...) when no `registry` is supplied:
+  redis?: string                                       // redis/valkey URL
+  keyPrefix?: string                                   // default 'coordinator'
+  strategy?: 'round-robin' | 'least-loaded' | 'random' | AllocationStrategy
+  cache?: { ttl?: number, max?: number } | false
+  requestTimeout?: number
+
+  registry?: Registry                                  // reuse an existing Registry (plugin will not close it)
+  decorateAs?: string                                  // default 'coordinator'
+  replyFrom?: FastifyReplyFromOptions                  // forwarded to @fastify/reply-from
+  registerReplyFrom?: boolean                          // default true; set false if you already registered reply-from
+}
+```
+
+The legacy standalone helper imports (`import { lookupAndProxy } from '@platformatic/coordinator'`) still work and are documented below. They require manually registering `@fastify/reply-from` and constructing the `Registry`.
 
 ## Valkey layout
 
@@ -148,9 +204,22 @@ Built-in least-loaded reads `load` from each candidate's member record (`HGET` p
 
 `resolveDestination` checks a local LRU+TTL cache before reading Valkey. Default 5 s TTL, 10 000 entries. Configure with `cache: { ttl, max }` or disable with `cache: false`. Writes through the registry (`addPodToDestination`, `deregisterDestination`) evict the affected key. Each replica has its own cache.
 
-## Fastify helpers
+## Fastify helpers (standalone, advanced)
 
-For HTTP-based coordinators, three helpers wrap the common patterns. Each emits a tagged result via an optional `onResult` callback so presets can hook their own metric counters.
+The helpers used internally by `app.coordinator.*` are also exported as standalone functions, for users who want to manage their own `Registry` and reply-from registration. Each emits a tagged result via an optional `onResult` callback so presets can hook their own metric counters.
+
+Before mounting any helper-backed route you must register `@fastify/reply-from` (the `coordinatorPlugin` does this for you):
+
+```ts
+import Fastify from 'fastify'
+import replyFrom from '@fastify/reply-from'
+import { Registry, lookupAndProxy } from '@platformatic/coordinator'
+
+const app = Fastify()
+await app.register(replyFrom)
+const registry = new Registry({ redis, keyPrefix })
+app.get('/x/:id', lookupAndProxy(registry, { destinationFrom: r => r.params.id }))
+```
 
 ### `lookupAndProxy`
 
@@ -184,19 +253,30 @@ app.delete('/destinations/:id', lookupAndDeregister(registry, {
 
 Resolves, proxies the delete; on `expectedStatus` (204 by default), `DEL`s the destination set. If the destination has only dead pods, skips the proxy and just deletes the set ("deregistered_dead_pod").
 
-All three helpers go through `@fastify/reply-from`, which the host application must register once before any helper-backed route is mounted.
+All four helpers go through `@fastify/reply-from`. The `coordinatorPlugin` registers it automatically; if you use the standalone helpers, you must register it yourself.
+
+### `lookupLockAndProxy`
+
+```ts
+app.post('/transactions/:lockId/work', lookupLockAndProxy(registry, {
+  lockFrom: req => req.params.lockId
+}))
+```
+
+Resolves the lockId to the pod that owns it (via `Registry.resolveLock`) and proxies through. 404s if the lockId is unknown.
 
 ## Testing
 
-Tests use Redis on `127.0.0.1:6390`. A `docker-compose.yml` is included.
+Unit tests need a Redis on `127.0.0.1:6390`. E2E tests also need a Postgres on `127.0.0.1:15432` (storage/storage/storage). Both are in the included `docker-compose.yml`.
 
 ```sh
-pnpm run test:redis:up
-pnpm test
-pnpm run test:redis:down
+pnpm run test:deps:up   # brings up redis + postgres
+pnpm test               # unit tests
+pnpm run test:e2e       # end-to-end tests (uses the storage-db example)
+pnpm run test:deps:down
 ```
 
-The URL is read from `REDIS_URL` (default `redis://127.0.0.1:6390`). Tests isolate keys with a random prefix and clean up after themselves.
+URLs are read from `REDIS_URL` (default `redis://127.0.0.1:6390`) and `PG_URL` (default `postgresql://storage:storage@127.0.0.1:15432/storage`). Tests isolate keys with a random prefix and clean up after themselves.
 
 ## License
 
