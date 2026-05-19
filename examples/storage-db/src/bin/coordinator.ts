@@ -1,6 +1,6 @@
 import Fastify from 'fastify'
 import { Registry } from '@platformatic/coordinator'
-import { coordinatorPlugin } from '../coordinator-plugin.ts'
+import { storageDbCoordinatorPlugin } from '../coordinator-plugin.ts'
 
 const env = (key: string, fallback?: string): string => {
   const v = process.env[key] ?? fallback
@@ -23,7 +23,7 @@ const registry = new Registry({
 })
 
 const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' } })
-await app.register(coordinatorPlugin, { registry })
+await app.register(storageDbCoordinatorPlugin, { registry })
 
 const shutdown = async (): Promise<void> => {
   try { await registry.close() } catch { /* ignore */ }

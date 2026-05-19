@@ -54,8 +54,10 @@ jobs:
           POSTGRES_USER: storage
           POSTGRES_PASSWORD: storage
           POSTGRES_DB: storage
+        # Map to host 15432 (matches docker-compose.yml so local devs avoid
+        # clashing with any other Postgres on 5432).
         ports:
-          - 5432:5432
+          - 15432:5432
         options: >-
           --health-cmd "pg_isready -U storage -d storage"
           --health-interval 10s
@@ -66,7 +68,7 @@ jobs:
         node-version: [22, 24, 26]
     env:
       REDIS_URL: redis://127.0.0.1:6390
-      PG_URL: postgresql://storage:storage@127.0.0.1:5432/storage
+      PG_URL: postgresql://storage:storage@127.0.0.1:15432/storage
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4

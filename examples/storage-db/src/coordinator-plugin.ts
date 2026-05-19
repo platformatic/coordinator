@@ -1,13 +1,6 @@
 import fp from 'fastify-plugin'
-import replyFrom from '@fastify/reply-from'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
-import {
-  Registry,
-  lookupAndProxy,
-  pickAndRegister,
-  lookupAndDeregister,
-  lookupLockAndProxy
-} from '@platformatic/coordinator'
+import { type Registry, coordinatorPlugin } from '@platformatic/coordinator'
 
 interface TenantParams { tenantId: string }
 interface LockParams { lockId: string }
@@ -54,45 +47,44 @@ const lockKeySchema = {
   }
 } as const
 
-async function coordinatorRoutes (app: FastifyInstance, opts: CoordinatorOptions): Promise<void> {
-  const { registry } = opts
-  await app.register(replyFrom)
+async function storageDbRoutes (app: FastifyInstance, opts: CoordinatorOptions): Promise<void> {
+  await app.register(coordinatorPlugin, { registry: opts.registry })
 
   const tenantFrom = (req: FastifyRequest): string => (req.params as TenantParams).tenantId
+  const lockFrom = (req: FastifyRequest): string => (req.params as LockParams).lockId
 
   app.get('/pods', async () => {
-    const members = await registry.listLiveMembers()
+    const members = await app.coordinator.registry.listLiveMembers()
     return { count: members.length, members }
   })
 
-  app.post('/tenants/:tenantId', { schema: tenantSchema }, pickAndRegister(registry, {
+  app.post('/tenants/:tenantId', { schema: tenantSchema }, app.coordinator.pickAndRegister({
     registerIdFrom: (body: any) => body.tenantId,
     expectedStatus: 201,
     unavailableMessage: 'no pods available'
   }))
 
-  const proxyOpts = {
+  const tenantProxy = app.coordinator.lookupAndProxy({
     destinationFrom: tenantFrom,
     reassignOrphans: true,
     notFoundMessage: 'tenant not found'
-  }
+  })
 
-  app.get('/tenants/:tenantId/keys', { schema: tenantSchema }, lookupAndProxy(registry, proxyOpts))
-  app.get('/tenants/:tenantId/keys/:key', { schema: tenantKeySchema }, lookupAndProxy(registry, proxyOpts))
-  app.put('/tenants/:tenantId/keys/:key', { schema: tenantKeySchema }, lookupAndProxy(registry, proxyOpts))
-  app.delete('/tenants/:tenantId/keys/:key', { schema: tenantKeySchema }, lookupAndProxy(registry, proxyOpts))
+  app.get('/tenants/:tenantId/keys', { schema: tenantSchema }, tenantProxy)
+  app.get('/tenants/:tenantId/keys/:key', { schema: tenantKeySchema }, tenantProxy)
+  app.put('/tenants/:tenantId/keys/:key', { schema: tenantKeySchema }, tenantProxy)
+  app.delete('/tenants/:tenantId/keys/:key', { schema: tenantKeySchema }, tenantProxy)
 
-  app.delete('/tenants/:tenantId', { schema: tenantSchema }, lookupAndDeregister(registry, {
+  app.delete('/tenants/:tenantId', { schema: tenantSchema }, app.coordinator.lookupAndDeregister({
     destinationFrom: tenantFrom,
     notFoundMessage: 'tenant not found'
   }))
 
   app.post('/tenants/:tenantId/transactions',
     { schema: tenantSchema },
-    lookupAndProxy(registry, proxyOpts))
+    tenantProxy)
 
-  const lockFrom = (req: FastifyRequest): string => (req.params as LockParams).lockId
-  const lockProxy = lookupLockAndProxy(registry, {
+  const lockProxy = app.coordinator.lookupLockAndProxy({
     lockFrom,
     notFoundMessage: 'transaction not found'
   })
@@ -103,4 +95,4 @@ async function coordinatorRoutes (app: FastifyInstance, opts: CoordinatorOptions
   app.post('/transactions/:lockId/rollback', { schema: lockSchema }, lockProxy)
 }
 
-export const coordinatorPlugin = fp(coordinatorRoutes, { name: 'storage-db-coordinator' })
+export const storageDbCoordinatorPlugin = fp(storageDbRoutes, { name: 'storage-db-coordinator' })

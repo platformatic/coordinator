@@ -32,3 +32,6 @@ export type { LookupLockAndProxyOptions, LookupLockAndProxyResult } from './help
 
 export { proxyVia } from './helpers/proxy-via.ts'
 export type { ProxyViaOptions, ProxyResolver, ProxyTarget } from './helpers/proxy-via.ts'
+
+export { default as coordinatorPlugin } from './plugin.ts'
+export type { CoordinatorPluginOptions } from './plugin.ts'

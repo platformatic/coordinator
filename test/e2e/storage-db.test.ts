@@ -8,8 +8,8 @@ import { fileURLToPath } from 'node:url'
 import { Redis } from 'iovalkey'
 import pg from 'pg'
 
-const REDIS_URL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379'
-const PG_URL = process.env.PG_URL ?? 'postgresql://storage:storage@127.0.0.1:5432/storage'
+const REDIS_URL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6390'
+const PG_URL = process.env.PG_URL ?? 'postgresql://storage:storage@127.0.0.1:15432/storage'
 const KEY_PREFIX = `e2e-${randomBytes(4).toString('hex')}`
 
 const COORDINATOR_PORT = 18080
