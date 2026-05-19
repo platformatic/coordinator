@@ -1,6 +1,6 @@
 {
   "name": "@platformatic/coordinator",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Multi-pod destination routing for stateful tiers: Valkey-backed registry with hash member records, set-based destinations, lock routing, and allocation strategies",
   "homepage": "https://github.com/platformatic/coordinator",
   "author": "Platformatic Inc. <oss@platformatic.dev> (https://platformatic.dev)",
