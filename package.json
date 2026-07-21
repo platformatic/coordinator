@@ -31,7 +31,7 @@
   },
   "dependencies": {
     "@fastify/reply-from": "^12.6.2",
-    "fastify-plugin": "^5.1.0",
+    "fastify-plugin": "^6.0.0",
     "iovalkey": "^0.3.3",
     "undici": "^7.23.0"
   },
