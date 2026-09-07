@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       redis:
-        image: redis:7
+        image: redis:8
         # Map host port 6390 to match the local docker-compose default,
         # so tests resolve REDIS_URL=redis://127.0.0.1:6390 with no env override.
         ports:
@@ -40,7 +40,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       redis:
-        image: redis:7
+        image: redis:8
         ports:
           - 6390:6379
         options: >-
