@@ -111,7 +111,66 @@ test('Registry', async (t) => {
     strictEqual(set.length, 1)
     ok(set[0] === m1 || set[0] === m2)
     ok(!set.includes('dead-pod'))
+    deepStrictEqual(result.previous, ['dead-pod'])
     await sharedRedis.del(destinationKey('inst-reassign'))
+  })
+
+  await t.test('resolveDestination with claimOnMiss binds a single pod under concurrent resolutions', async () => {
+    // Separate registries with round-robin picks would bind different pods if the claim was not atomic
+    const registries = Array.from({ length: 5 }, () => new Registry({ redis: REDIS_URL, keyPrefix: PREFIX, cache: false }))
+    try {
+      const results = await Promise.all(
+        registries.flatMap(r => [r.resolveDestination('inst-race', { claimOnMiss: true }), r.resolveDestination('inst-race', { claimOnMiss: true })])
+      )
+      const set = await sharedRedis.smembers(destinationKey('inst-race'))
+      strictEqual(set.length, 1)
+      ok(results.every(result => result?.memberId === set[0]))
+      strictEqual(results.filter(result => result?.reassigned).length, 0)
+    } finally {
+      await Promise.all(registries.map(r => r.close()))
+      await sharedRedis.del(destinationKey('inst-race'))
+    }
+  })
+
+  await t.test('resolveDestination with reassignOrphans reassigns once under concurrent resolutions', async () => {
+    await sharedRedis.sadd(destinationKey('inst-reassign-race'), 'dead-pod')
+    const registries = Array.from({ length: 5 }, () => new Registry({ redis: REDIS_URL, keyPrefix: PREFIX, cache: false }))
+    try {
+      const results = await Promise.all(registries.map(r => r.resolveDestination('inst-reassign-race', { reassignOrphans: true })))
+      const set = await sharedRedis.smembers(destinationKey('inst-reassign-race'))
+      strictEqual(set.length, 1)
+      ok(results.every(result => result?.memberId === set[0]))
+      strictEqual(results.filter(result => result?.reassigned).length, 1)
+    } finally {
+      await Promise.all(registries.map(r => r.close()))
+      await sharedRedis.del(destinationKey('inst-reassign-race'))
+    }
+  })
+
+  await t.test('resolveDestination picks another pod when the candidate expires before the claim', async () => {
+    let picks = 0
+    const picky = new Registry({
+      redis: REDIS_URL,
+      keyPrefix: PREFIX,
+      cache: false,
+      strategy: {
+        pick (candidates) {
+          // The first pick is a pod whose record expired after it was listed
+          if (picks++ === 0) return { memberId: 'expired', address: 'http://localhost:3999', load: 0 }
+          return candidates[0] ?? null
+        }
+      }
+    })
+    try {
+      const resolved = await picky.resolveDestination('inst-stale', { claimOnMiss: true })
+      ok(resolved)
+      strictEqual(picks, 2)
+      ok(resolved.memberId === m1 || resolved.memberId === m2)
+      deepStrictEqual(await sharedRedis.smembers(destinationKey('inst-stale')), [resolved.memberId])
+    } finally {
+      await picky.close()
+      await sharedRedis.del(destinationKey('inst-stale'))
+    }
   })
 
   await t.test('resolveDestination with multi-pod set picks one live pod, cleans dead members in background', async () => {
@@ -241,5 +300,29 @@ test('Registry', async (t) => {
   await t.test('close quits the registry-owned Redis connection', async () => {
     const owned = new Registry({ redis: REDIS_URL, cache: false })
     await owned.close()
+  })
+
+  await t.test('an existing client is used and left open by close', async () => {
+    const client = new Redis(REDIS_URL)
+    try {
+      const shared = new Registry({ redis: client, keyPrefix: PREFIX, cache: false })
+      await sharedRedis.sadd(destinationKey('inst-shared'), m1)
+      strictEqual((await shared.resolveDestination('inst-shared'))?.memberId, m1)
+      await shared.close()
+      strictEqual(await client.ping(), 'PONG')
+    } finally {
+      await client.quit()
+      await sharedRedis.del(destinationKey('inst-shared'))
+    }
+  })
+
+  await t.test('redisOptions are applied to the client created from a URL', async () => {
+    const configured = new Registry({ redis: REDIS_URL, redisOptions: { db: 1 }, keyPrefix: PREFIX, cache: false })
+    try {
+      // Members registered in db 0 are not visible
+      deepStrictEqual(await configured.listLiveMembers(), [])
+    } finally {
+      await configured.close()
+    }
   })
 })
