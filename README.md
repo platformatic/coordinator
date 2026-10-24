@@ -73,7 +73,8 @@ Options:
 ```ts
 interface CoordinatorPluginOptions {
   // Forwarded to new Registry(...) when no `registry` is supplied:
-  redis?: string                                       // redis/valkey URL
+  redis?: string | Redis                               // redis/valkey URL, or an existing iovalkey client
+  redisOptions?: RedisOptions                          // options for the client created from a URL
   keyPrefix?: string                                   // default 'coordinator'
   strategy?: 'round-robin' | 'least-loaded' | 'random' | AllocationStrategy
   cache?: { ttl?: number, max?: number } | false
@@ -101,7 +102,7 @@ With `keyPrefix: 'myservice'`:
 
 ## Pod side: `Member`
 
-The pod-side class owns its own iovalkey connection and writes the keys the pod is responsible for.
+The pod-side class writes the keys the pod is responsible for. `redis` is either a URL, for which it creates its own iovalkey connection (configured with the optional `redisOptions`), or an existing iovalkey client, which it shares and does not close.
 
 ```ts
 import { Member } from '@platformatic/coordinator'
@@ -116,7 +117,7 @@ const member = new Member({
 })
 
 await member.register()                                 // SADD + HSET + EXPIRE
-const heartbeat = setInterval(() => member.heartbeat(), 10_000)  // HSET + EXPIRE
+const heartbeat = setInterval(() => member.heartbeat(), 10_000)  // SADD + HSET + EXPIRE, restores an expired record
 heartbeat.unref()
 
 // When this pod fans itself in to a destination:
@@ -138,6 +139,10 @@ await member.close()
 
 ## Coordinator side: `Registry`
 
+Like `Member`, `redis` is either a URL (with optional `redisOptions`) or an existing iovalkey client, which is not closed by `registry.close()`.
+
+Claims and reassignments are atomic: concurrent `resolveDestination` calls, from any number of registries, bind a single pod and agree on it.
+
 ```ts
 import { Registry } from '@platformatic/coordinator'
 
@@ -154,7 +159,7 @@ const resolved = await registry.resolveDestination(destId, {
   reassignOrphans: true   // SREM dead + SADD fresh if every pod in the set is dead
 })
 if (resolved) {
-  // { address, memberId, reassigned }
+  // { address, memberId, reassigned, previous? }  previous lists the dead pods replaced by a reassignment
 }
 
 // Lock-bound call: route by lockId, not destination.

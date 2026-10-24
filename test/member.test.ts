@@ -147,4 +147,28 @@ test('Member', async (t) => {
     strictEqual(v, '0')
     await m.close()
   })
+
+  await t.test('heartbeat restores a record which expired', async () => {
+    const m = new Member({ redis: REDIS_URL, memberId: 'm-expired', address, keyPrefix: PREFIX })
+    await m.register()
+
+    // For instance after Valkey was unreachable for longer than the TTL
+    await sharedRedis.del(memberKey('m-expired'))
+    await sharedRedis.srem(membersKey(), 'm-expired')
+
+    await m.heartbeat()
+    strictEqual(await sharedRedis.sismember(membersKey(), 'm-expired'), 1)
+    deepStrictEqual(await sharedRedis.hmget(memberKey('m-expired'), 'address', 'load'), [address, '0'])
+    await m.close()
+  })
+
+  await t.test('an existing client is used and left open by close', async () => {
+    const client = new Redis(REDIS_URL)
+    const m = new Member({ redis: client, memberId: 'm-shared', address, keyPrefix: PREFIX })
+    await m.register()
+    strictEqual(await sharedRedis.hget(memberKey('m-shared'), 'address'), address)
+    await m.close()
+    strictEqual(await client.ping(), 'PONG')
+    await client.quit()
+  })
 })

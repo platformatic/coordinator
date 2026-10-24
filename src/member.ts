@@ -1,8 +1,12 @@
-import { Redis } from 'iovalkey'
+import type { Redis, RedisOptions } from 'iovalkey'
+import { connect, type RedisConnection } from './connection.ts'
 import type { MemberInfo } from './strategies.ts'
 
 export interface MemberOptions {
-  redis: string
+  /** A Valkey URL, or an existing client which is not closed by close(). */
+  redis: RedisConnection
+  /** Options for the client created from a URL. */
+  redisOptions?: RedisOptions
   memberId: string
   address: string
   keyPrefix?: string
@@ -12,6 +16,7 @@ export interface MemberOptions {
 
 export class Member {
   #redis: Redis
+  #ownsRedis: boolean
   #memberId: string
   #address: string
   #keyPrefix: string
@@ -19,7 +24,9 @@ export class Member {
   #getLoad: () => number
 
   constructor (opts: MemberOptions) {
-    this.#redis = new Redis(opts.redis)
+    const { redis, owned } = connect(opts.redis, opts.redisOptions)
+    this.#redis = redis
+    this.#ownsRedis = owned
     this.#memberId = opts.memberId
     this.#address = opts.address
     this.#keyPrefix = opts.keyPrefix ?? 'coordinator'
@@ -52,19 +59,22 @@ export class Member {
   }
 
   async register (): Promise<void> {
+    await this.#writeRecord()
+  }
+
+  // Rewrites the whole record, so that a member whose record expired (for instance while Valkey was unreachable for
+  // longer than the TTL) becomes live again instead of keeping a record without an address.
+  async heartbeat (): Promise<void> {
+    await this.#writeRecord()
+  }
+
+  async #writeRecord (): Promise<void> {
     const pipeline = this.#redis.pipeline()
     pipeline.sadd(this.#membersKey(), this.#memberId)
     pipeline.hset(this.#memberKey(), {
       address: this.#address,
       load: String(this.#getLoad())
     })
-    pipeline.expire(this.#memberKey(), this.#ttl)
-    await pipeline.exec()
-  }
-
-  async heartbeat (): Promise<void> {
-    const pipeline = this.#redis.pipeline()
-    pipeline.hset(this.#memberKey(), 'load', String(this.#getLoad()))
     pipeline.expire(this.#memberKey(), this.#ttl)
     await pipeline.exec()
   }
@@ -124,6 +134,6 @@ export class Member {
   }
 
   async close (): Promise<void> {
-    await this.#redis.quit()
+    if (this.#ownsRedis) await this.#redis.quit()
   }
 }
