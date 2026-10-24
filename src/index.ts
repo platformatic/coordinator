@@ -3,6 +3,7 @@ export type { RegistryOptions, ResolveResult, ResolveLockResult } from './regist
 
 export { Member } from './member.ts'
 export type { MemberOptions } from './member.ts'
+export type { RedisConnection } from './connection.ts'
 
 export {
   RoundRobinStrategy,

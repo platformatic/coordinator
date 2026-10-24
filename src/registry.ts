@@ -1,9 +1,13 @@
-import { Redis } from 'iovalkey'
+import type { Redis, RedisOptions } from 'iovalkey'
+import { connect, type RedisConnection } from './connection.ts'
 import { createStrategy, type AllocationStrategy, type MemberInfo } from './strategies.ts'
 import { TTLCache, type CacheOptions } from './cache.ts'
 
 export interface RegistryOptions {
-  redis: string
+  /** A Valkey URL, or an existing client which is not closed by close(). */
+  redis: RedisConnection
+  /** Options for the client created from a URL. */
+  redisOptions?: RedisOptions
   keyPrefix?: string
   strategy?: 'round-robin' | 'least-loaded' | 'random' | AllocationStrategy
   requestTimeout?: number
@@ -14,6 +18,8 @@ export interface ResolveResult {
   address: string
   memberId: string
   reassigned: boolean
+  /** When reassigned, the dead members which were removed from the destination. */
+  previous?: string[]
 }
 
 export interface ResolveLockResult {
@@ -21,21 +27,80 @@ export interface ResolveLockResult {
   memberId: string
 }
 
-interface MemberRecord {
-  memberId: string
-  address: string | null
-  load: number
+// Resolves a destination atomically. Live members are returned as flat [memberId, address, load] triples, and dead
+// members are pruned when at least one is live. Without a candidate (ARGV[2]) it only reports how many members the
+// set holds; with one, it binds the candidate when the set is empty (ARGV[3] = '1', claim) or when every member is dead
+// (ARGV[4] = '1', reassign). Concurrent resolutions therefore agree: a caller losing the race gets the members bound by
+// the winner instead of adding its own candidate.
+const resolveScript = `
+  local members = redis.call('SMEMBERS', KEYS[1])
+  local live = {}
+  local dead = {}
+
+  for _, member in ipairs(members) do
+    local fields = redis.call('HMGET', ARGV[1] .. member, 'address', 'load')
+
+    if fields[1] then
+      table.insert(live, member)
+      table.insert(live, fields[1])
+      table.insert(live, fields[2] or '0')
+    else
+      table.insert(dead, member)
+    end
+  end
+
+  if #live > 0 then
+    if #dead > 0 then
+      redis.call('SREM', KEYS[1], unpack(dead))
+    end
+
+    return { 'live', live }
+  end
+
+  local allowed = (#members == 0 and ARGV[3] == '1') or (#members > 0 and ARGV[4] == '1')
+
+  if ARGV[2] == '' or not allowed then
+    return { 'empty', #members }
+  end
+
+  local address = redis.call('HGET', ARGV[1] .. ARGV[2], 'address')
+
+  if not address then
+    return { 'stale' }
+  end
+
+  redis.call('DEL', KEYS[1])
+  redis.call('SADD', KEYS[1], ARGV[2])
+
+  return { 'bound', { ARGV[2], address }, dead }
+`
+
+// A candidate can expire between the pick and the script, in which case another one is picked
+const maxBindAttempts = 3
+
+type ResolveReply =
+  | ['live', string[]]
+  | ['empty', number]
+  | ['stale']
+  | ['bound', [string, string], string[]]
+
+interface ResolveCommand {
+  coordinatorResolve (key: string, memberPrefix: string, candidate: string, claim: string, reassign: string): Promise<ResolveReply>
 }
 
 export class Registry {
-  #redis: Redis
+  #redis: Redis & ResolveCommand
+  #ownsRedis: boolean
   #keyPrefix: string
   #strategy: AllocationStrategy
   #cache: TTLCache<string, ResolveResult> | null
   readonly requestTimeout: number | undefined
 
   constructor (opts: RegistryOptions) {
-    this.#redis = new Redis(opts.redis)
+    const { redis, owned } = connect(opts.redis, opts.redisOptions)
+    redis.defineCommand('coordinatorResolve', { numberOfKeys: 1, lua: resolveScript })
+    this.#redis = redis as Redis & ResolveCommand
+    this.#ownsRedis = owned
     this.#keyPrefix = opts.keyPrefix ?? 'coordinator'
 
     if (typeof opts.strategy === 'object' && opts.strategy !== null) {
@@ -111,70 +176,47 @@ export class Registry {
     destinationId: string,
     opts: { claimOnMiss?: boolean, reassignOrphans?: boolean }
   ): Promise<ResolveResult | null> {
-    const podIds = await this.#redis.smembers(this.#destinationKey(destinationId))
+    const key = this.#destinationKey(destinationId)
+    const memberPrefix = this.#memberKey('')
+    const claim = opts.claimOnMiss ? '1' : '0'
+    const reassign = opts.reassignOrphans ? '1' : '0'
 
-    if (podIds.length === 0) {
-      if (!opts.claimOnMiss) return null
-      const live = await this.listLiveMembers()
-      if (live.length === 0) return null
-      const picked = this.#strategy.pick(live, { destinationId })
-      if (!picked) return null
-      await this.#redis.sadd(this.#destinationKey(destinationId), picked.memberId)
-      return { address: picked.address, memberId: picked.memberId, reassigned: false }
-    }
+    let reply = await this.#redis.coordinatorResolve(key, memberPrefix, '', claim, reassign)
 
-    const records = await this.#getMemberRecords(podIds)
-    const livePods: MemberInfo[] = []
-    const deadPods: string[] = []
-    for (const r of records) {
-      if (r.address) {
-        livePods.push({ memberId: r.memberId, address: r.address, load: r.load })
-      } else {
-        deadPods.push(r.memberId)
+    for (let attempt = 0; attempt < maxBindAttempts; attempt++) {
+      if (reply[0] === 'live') {
+        return this.#pickLive(destinationId, reply[1])
       }
-    }
 
-    if (livePods.length > 0) {
-      if (deadPods.length > 0) {
-        this.#redis.srem(this.#destinationKey(destinationId), ...deadPods).catch(() => {})
+      if (reply[0] === 'bound') {
+        const [, [memberId, address], dead] = reply
+        return dead.length > 0
+          ? { address, memberId, reassigned: true, previous: dead }
+          : { address, memberId, reassigned: false }
       }
-      const picked = this.#strategy.pick(livePods, { destinationId })
+
+      if (reply[0] === 'empty') {
+        const wanted = reply[1] === 0 ? opts.claimOnMiss : opts.reassignOrphans
+        if (!wanted) return null
+      }
+
+      const picked = await this.pickMember({ destinationId })
       if (!picked) return null
-      return { address: picked.address, memberId: picked.memberId, reassigned: false }
+
+      reply = await this.#redis.coordinatorResolve(key, memberPrefix, picked.memberId, claim, reassign)
     }
 
-    if (!opts.reassignOrphans) return null
-    const live = await this.listLiveMembers()
-    if (live.length === 0) return null
-    const picked = this.#strategy.pick(live, { destinationId })
-    if (!picked) return null
-
-    const pipeline = this.#redis.pipeline()
-    for (const deadId of deadPods) {
-      pipeline.srem(this.#destinationKey(destinationId), deadId)
-    }
-    pipeline.sadd(this.#destinationKey(destinationId), picked.memberId)
-    await pipeline.exec()
-
-    return { address: picked.address, memberId: picked.memberId, reassigned: true }
+    return reply[0] === 'live' ? this.#pickLive(destinationId, reply[1]) : null
   }
 
-  async #getMemberRecords (memberIds: string[]): Promise<MemberRecord[]> {
-    if (memberIds.length === 0) return []
-    const pipeline = this.#redis.pipeline()
-    for (const id of memberIds) {
-      pipeline.hmget(this.#memberKey(id), 'address', 'load')
+  #pickLive (destinationId: string, triples: string[]): ResolveResult | null {
+    const live: MemberInfo[] = []
+    for (let i = 0; i < triples.length; i += 3) {
+      live.push({ memberId: triples[i], address: triples[i + 1], load: parseInt(triples[i + 2], 10) || 0 })
     }
-    const results = await pipeline.exec()
-    if (!results) return memberIds.map(memberId => ({ memberId, address: null, load: 0 }))
-
-    return memberIds.map((memberId, i) => {
-      const [err, fields] = results[i] as [Error | null, (string | null)[] | null]
-      if (err || !fields) return { memberId, address: null, load: 0 }
-      const address = fields[0] ?? null
-      const load = parseInt(fields[1] ?? '0', 10) || 0
-      return { memberId, address, load }
-    })
+    const picked = this.#strategy.pick(live, { destinationId })
+    if (!picked) return null
+    return { address: picked.address, memberId: picked.memberId, reassigned: false }
   }
 
   async addPodToDestination (destinationId: string, memberId: string): Promise<void> {
@@ -205,6 +247,6 @@ export class Registry {
   }
 
   async close (): Promise<void> {
-    await this.#redis.quit()
+    if (this.#ownsRedis) await this.#redis.quit()
   }
 }
