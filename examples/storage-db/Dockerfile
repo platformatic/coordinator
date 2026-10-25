@@ -6,11 +6,11 @@ RUN corepack enable
 
 WORKDIR /workspace
 
-COPY pnpm-workspace.yaml package.json ./
+COPY pnpm-workspace.yaml package.json pnpm-lock.yaml ./
 COPY examples/storage-db/package.json examples/storage-db/
 
 RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
-    pnpm install
+    pnpm install --frozen-lockfile
 
 COPY src ./src
 COPY tsconfig.json ./
