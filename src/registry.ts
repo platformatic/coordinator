@@ -214,7 +214,9 @@ export class Registry {
     for (let i = 0; i < triples.length; i += 3) {
       live.push({ memberId: triples[i], address: triples[i + 1], load: parseInt(triples[i + 2], 10) || 0 })
     }
-    const picked = this.#strategy.pick(live, { destinationId })
+    // A destination bound to a single live pod does not consult the strategy, so that lookups do not advance stateful
+    // strategies like round-robin, which would skew the picks for new destinations
+    const picked = live.length === 1 ? live[0] : this.#strategy.pick(live, { destinationId })
     if (!picked) return null
     return { address: picked.address, memberId: picked.memberId, reassigned: false }
   }

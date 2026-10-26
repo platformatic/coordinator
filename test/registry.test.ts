@@ -115,6 +115,21 @@ test('Registry', async (t) => {
     await sharedRedis.del(destinationKey('inst-reassign'))
   })
 
+  await t.test('resolveDestination lookups of single-pod destinations do not advance round-robin', async () => {
+    const rr = new Registry({ redis: REDIS_URL, keyPrefix: PREFIX, strategy: 'round-robin', cache: false })
+    try {
+      const first = await rr.resolveDestination('inst-rr-1', { claimOnMiss: true })
+      // Looking up the existing binding must not change the next pick
+      await rr.resolveDestination('inst-rr-1', { claimOnMiss: true })
+      const second = await rr.resolveDestination('inst-rr-2', { claimOnMiss: true })
+      ok(first && second)
+      ok(first.memberId !== second.memberId, 'both destinations were bound to the same pod')
+    } finally {
+      await rr.close()
+      await sharedRedis.del(destinationKey('inst-rr-1'), destinationKey('inst-rr-2'))
+    }
+  })
+
   await t.test('resolveDestination with claimOnMiss binds a single pod under concurrent resolutions', async () => {
     // Separate registries with round-robin picks would bind different pods if the claim was not atomic
     const registries = Array.from({ length: 5 }, () => new Registry({ redis: REDIS_URL, keyPrefix: PREFIX, cache: false }))
