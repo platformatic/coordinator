@@ -171,7 +171,7 @@ importers:
         version: 12.8.0
       fastify-plugin:
         specifier: ^6.0.0
-        version: 6.0.0
+        version: 6.0.1
       iovalkey:
         specifier: ^0.4.0
         version: 0.4.0(supports-color@7.2.0)
