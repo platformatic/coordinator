@@ -98,6 +98,7 @@ With `keyPrefix: 'myservice'`:
 | `myservice:members` | set | pod | the set of memberIds known to be live |
 | `myservice:member:<memberId>` | hash with `address`, `load` and, while draining, `draining` | pod | live pod registration and load metric, TTL refreshed by heartbeat |
 | `myservice:destination:<id>` | set of memberIds | coordinator + pod | pods currently serving this destination |
+| `myservice:owned:<memberId>` | set of destination ids | coordinator + pod | the destinations of a pod, with the `memberIndex` option |
 | `myservice:lock:<lockId>` | hash with `podId`, `destinationId`, metadata | pod | lockId routing for transaction-bound calls |
 
 ## Pod side: `Member`
@@ -178,8 +179,15 @@ await registry.pickMember({ destinationId: destId })
 await registry.addPodToDestination(destId, memberId)
 await registry.hasBinding(destId)
 await registry.deregisterDestination(destId)
+await registry.listOwned(memberId)                // the destinations of a pod, with the member index
 await registry.close()
 ```
+
+### Member index
+
+With `memberIndex: true`, on the `Registry` and on every `Member`, each binding also records the destination in the set of the pod, `myservice:owned:<memberId>`, in the same script or transaction: claims and reassignments add it to the new pod and remove it from the pods unbound, pruning a dead pod removes it, `addPodToDestination`, `deregisterDestination`, `member.addToDestination()` and `member.removeFromDestination()` do the same. `registry.listOwned(memberId)` and `member.listOwned()` read the set, so that the destinations of a pod are listed without scanning them all, i.e. to move them before the pod stops.
+
+The index is exact only if every writer of the destinations maintains it, this library and any script of the application alike: enable it everywhere at once, and fill the sets of the destinations bound before, with a scan, before relying on it.
 
 ## Resolution and failover
 

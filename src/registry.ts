@@ -12,6 +12,12 @@ export interface RegistryOptions {
   strategy?: 'round-robin' | 'least-loaded' | 'random' | AllocationStrategy
   requestTimeout?: number
   cache?: CacheOptions | false
+  /**
+   * Maintains a set of the destinations bound to each member, `<keyPrefix>:owned:<memberId>`, atomically with every
+   * binding made by this registry, so that the destinations of a member are listed without scanning them all. Every
+   * writer of the destinations must maintain it, see the README.
+   */
+  memberIndex?: boolean
 }
 
 export interface ResolveResult {
@@ -32,6 +38,8 @@ export interface ResolveLockResult {
 // set holds; with one, it binds the candidate when the set is empty (ARGV[3] = '1', claim) or when every member is dead
 // (ARGV[4] = '1', reassign). Concurrent resolutions therefore agree: a caller losing the race gets the members bound by
 // the winner instead of adding its own candidate. A candidate which is draining is refused: the caller picks another.
+// With a member index (ARGV[5] is its key prefix, ARGV[6] the destination), the sets of the members bound and unbound
+// are updated in the same script.
 const resolveScript = `
   local members = redis.call('SMEMBERS', KEYS[1])
   local live = {}
@@ -52,6 +60,12 @@ const resolveScript = `
   if #live > 0 then
     if #dead > 0 then
       redis.call('SREM', KEYS[1], unpack(dead))
+
+      if ARGV[5] ~= '' then
+        for _, member in ipairs(dead) do
+          redis.call('SREM', ARGV[5] .. member, ARGV[6])
+        end
+      end
     end
 
     return { 'live', live }
@@ -79,6 +93,14 @@ const resolveScript = `
   redis.call('DEL', KEYS[1])
   redis.call('SADD', KEYS[1], ARGV[2])
 
+  if ARGV[5] ~= '' then
+    for _, member in ipairs(members) do
+      redis.call('SREM', ARGV[5] .. member, ARGV[6])
+    end
+
+    redis.call('SADD', ARGV[5] .. ARGV[2], ARGV[6])
+  end
+
   return { 'bound', { ARGV[2], address }, dead }
 `
 
@@ -93,7 +115,7 @@ type ResolveReply =
   | ['bound', [string, string], string[]]
 
 interface ResolveCommand {
-  coordinatorResolve (key: string, memberPrefix: string, candidate: string, claim: string, reassign: string): Promise<ResolveReply>
+  coordinatorResolve (key: string, memberPrefix: string, candidate: string, claim: string, reassign: string, ownedPrefix: string, destinationId: string): Promise<ResolveReply>
 }
 
 export class Registry {
@@ -102,6 +124,7 @@ export class Registry {
   #keyPrefix: string
   #strategy: AllocationStrategy
   #cache: TTLCache<string, ResolveResult> | null
+  #memberIndex: boolean
   readonly requestTimeout: number | undefined
 
   constructor (opts: RegistryOptions) {
@@ -121,6 +144,7 @@ export class Registry {
       ? null
       : new TTLCache<string, ResolveResult>(opts.cache)
     this.requestTimeout = opts.requestTimeout
+    this.#memberIndex = opts.memberIndex ?? false
   }
 
   #membersKey (): string {
@@ -137,6 +161,15 @@ export class Registry {
 
   #lockKey (lockId: string): string {
     return `${this.#keyPrefix}:lock:${lockId}`
+  }
+
+  // The prefix of the sets of the member index, or '' when the index is not maintained
+  #ownedPrefix (): string {
+    return this.#memberIndex ? `${this.#keyPrefix}:owned:` : ''
+  }
+
+  #ownedKey (memberId: string): string {
+    return `${this.#keyPrefix}:owned:${memberId}`
   }
 
   async listLiveMembers (): Promise<MemberInfo[]> {
@@ -192,7 +225,8 @@ export class Registry {
     const claim = opts.claimOnMiss ? '1' : '0'
     const reassign = opts.reassignOrphans ? '1' : '0'
 
-    let reply = await this.#redis.coordinatorResolve(key, memberPrefix, '', claim, reassign)
+    const ownedPrefix = this.#ownedPrefix()
+    let reply = await this.#redis.coordinatorResolve(key, memberPrefix, '', claim, reassign, ownedPrefix, destinationId)
     const refused: string[] = []
     let picked: MemberInfo | null = null
 
@@ -221,7 +255,7 @@ export class Registry {
       picked = await this.pickMember({ destinationId, exclude: refused })
       if (!picked) return null
 
-      reply = await this.#redis.coordinatorResolve(key, memberPrefix, picked.memberId, claim, reassign)
+      reply = await this.#redis.coordinatorResolve(key, memberPrefix, picked.memberId, claim, reassign, ownedPrefix, destinationId)
     }
 
     return reply[0] === 'live' ? this.#pickLive(destinationId, reply[1]) : null
@@ -240,8 +274,17 @@ export class Registry {
   }
 
   async addPodToDestination (destinationId: string, memberId: string): Promise<void> {
-    await this.#redis.sadd(this.#destinationKey(destinationId), memberId)
+    if (this.#memberIndex) {
+      await this.#redis.multi().sadd(this.#destinationKey(destinationId), memberId).sadd(this.#ownedKey(memberId), destinationId).exec()
+    } else {
+      await this.#redis.sadd(this.#destinationKey(destinationId), memberId)
+    }
     if (this.#cache) this.#cache.delete(destinationId)
+  }
+
+  // The destinations bound to a member, from the member index
+  async listOwned (memberId: string): Promise<string[]> {
+    return this.#redis.smembers(this.#ownedKey(memberId))
   }
 
   async hasBinding (destinationId: string): Promise<boolean> {
@@ -262,7 +305,15 @@ export class Registry {
   }
 
   async deregisterDestination (destinationId: string): Promise<void> {
-    await this.#redis.del(this.#destinationKey(destinationId))
+    const key = this.#destinationKey(destinationId)
+    if (this.#memberIndex) {
+      const members = await this.#redis.smembers(key)
+      const multi = this.#redis.multi().del(key)
+      for (const memberId of members) multi.srem(this.#ownedKey(memberId), destinationId)
+      await multi.exec()
+    } else {
+      await this.#redis.del(key)
+    }
     if (this.#cache) this.#cache.delete(destinationId)
   }
 

@@ -12,6 +12,8 @@ export interface MemberOptions {
   keyPrefix?: string
   ttl?: number
   getLoad?: () => number
+  /** Maintains the set of the destinations of this member, see the `memberIndex` option of `Registry`. */
+  memberIndex?: boolean
 }
 
 export class Member {
@@ -22,6 +24,7 @@ export class Member {
   #keyPrefix: string
   #ttl: number
   #getLoad: () => number
+  #memberIndex: boolean
 
   constructor (opts: MemberOptions) {
     const { redis, owned } = connect(opts.redis, opts.redisOptions)
@@ -32,6 +35,7 @@ export class Member {
     this.#keyPrefix = opts.keyPrefix ?? 'coordinator'
     this.#ttl = opts.ttl ?? 30
     this.#getLoad = opts.getLoad ?? (() => 0)
+    this.#memberIndex = opts.memberIndex ?? false
   }
 
   get memberId (): string {
@@ -52,6 +56,10 @@ export class Member {
 
   #destinationKey (destId: string): string {
     return `${this.#keyPrefix}:destination:${destId}`
+  }
+
+  #ownedKey (): string {
+    return `${this.#keyPrefix}:owned:${this.#memberId}`
   }
 
   #lockKey (lockId: string): string {
@@ -98,11 +106,24 @@ export class Member {
   }
 
   async addToDestination (destinationId: string): Promise<void> {
-    await this.#redis.sadd(this.#destinationKey(destinationId), this.#memberId)
+    if (this.#memberIndex) {
+      await this.#redis.multi().sadd(this.#destinationKey(destinationId), this.#memberId).sadd(this.#ownedKey(), destinationId).exec()
+    } else {
+      await this.#redis.sadd(this.#destinationKey(destinationId), this.#memberId)
+    }
   }
 
   async removeFromDestination (destinationId: string): Promise<void> {
-    await this.#redis.srem(this.#destinationKey(destinationId), this.#memberId)
+    if (this.#memberIndex) {
+      await this.#redis.multi().srem(this.#destinationKey(destinationId), this.#memberId).srem(this.#ownedKey(), destinationId).exec()
+    } else {
+      await this.#redis.srem(this.#destinationKey(destinationId), this.#memberId)
+    }
+  }
+
+  // The destinations of this member, from the member index
+  async listOwned (): Promise<string[]> {
+    return this.#redis.smembers(this.#ownedKey())
   }
 
   async registerLock (

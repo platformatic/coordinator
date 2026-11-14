@@ -248,6 +248,55 @@ test('Registry', async (t) => {
     }
   })
 
+  await t.test('the member index follows the bindings of the registry which maintains it', async () => {
+    const indexed = new Registry({ redis: REDIS_URL, keyPrefix: PREFIX, cache: false, memberIndex: true, strategy: 'round-robin' })
+    const ownedKey = (id: string): string => `${PREFIX}:owned:${id}`
+
+    try {
+      // Claims add the destination to the set of the member bound
+      const first = await indexed.resolveDestination('inst-owned-1', { claimOnMiss: true })
+      const second = await indexed.resolveDestination('inst-owned-2', { claimOnMiss: true })
+      ok(first && second)
+      deepStrictEqual((await indexed.listOwned(first.memberId)).includes('inst-owned-1'), true)
+      deepStrictEqual((await indexed.listOwned(second.memberId)).includes('inst-owned-2'), true)
+
+      // A reassignment moves the destination from the dead member to the new one
+      await sharedRedis.sadd(destinationKey('inst-owned-orphan'), 'dead-pod')
+      await sharedRedis.sadd(ownedKey('dead-pod'), 'inst-owned-orphan', 'inst-owned-pruned')
+      const reassigned = await indexed.resolveDestination('inst-owned-orphan', { reassignOrphans: true })
+      ok(reassigned)
+      deepStrictEqual(await sharedRedis.sismember(ownedKey('dead-pod'), 'inst-owned-orphan'), 0)
+      deepStrictEqual(await sharedRedis.sismember(ownedKey(reassigned.memberId), 'inst-owned-orphan'), 1)
+
+      // Pruning a dead member from a destination with live ones removes it from its set
+      await sharedRedis.sadd(destinationKey('inst-owned-pruned'), m1, 'dead-pod')
+      await sharedRedis.sadd(ownedKey(m1), 'inst-owned-pruned')
+      ok(await indexed.resolveDestination('inst-owned-pruned'))
+      deepStrictEqual(await sharedRedis.sismember(ownedKey('dead-pod'), 'inst-owned-pruned'), 0)
+      deepStrictEqual(await sharedRedis.sismember(ownedKey(m1), 'inst-owned-pruned'), 1)
+
+      // Explicit bindings and deregistrations maintain it too
+      await indexed.addPodToDestination('inst-owned-added', m2)
+      deepStrictEqual(await sharedRedis.sismember(ownedKey(m2), 'inst-owned-added'), 1)
+      await indexed.deregisterDestination('inst-owned-added')
+      deepStrictEqual(await sharedRedis.sismember(ownedKey(m2), 'inst-owned-added'), 0)
+      deepStrictEqual(await sharedRedis.exists(destinationKey('inst-owned-added')), 0)
+
+      // A registry without the index writes none of it
+      const plain = await registry.resolveDestination('inst-owned-plain', { claimOnMiss: true })
+      ok(plain)
+      deepStrictEqual(await sharedRedis.sismember(ownedKey(plain.memberId), 'inst-owned-plain'), 0)
+    } finally {
+      await indexed.close()
+      for (const id of ['inst-owned-1', 'inst-owned-2', 'inst-owned-orphan', 'inst-owned-pruned', 'inst-owned-added', 'inst-owned-plain']) {
+        await sharedRedis.del(destinationKey(id))
+      }
+      for (const id of [m1, m2, 'dead-pod']) {
+        await sharedRedis.del(ownedKey(id))
+      }
+    }
+  })
+
   await t.test('resolveDestination with multi-pod set picks one live pod, cleans dead members in background', async () => {
     await sharedRedis.sadd(destinationKey('inst-multi'), m1, 'dead-pod', m2)
     const result = await registry.resolveDestination('inst-multi')
