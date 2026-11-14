@@ -176,7 +176,7 @@ if (lockRouting) {
 // Other primitives:
 await registry.listLiveMembers()                  // [{ memberId, address, load, draining }, ...]
 await registry.pickMember({ destinationId: destId })
-await registry.addPodToDestination(destId, memberId)
+await registry.addPodToDestination(destId, memberId)  // false when the pod is draining: nothing is bound
 await registry.hasBinding(destId)
 await registry.deregisterDestination(destId)
 await registry.listOwned(memberId)                // the destinations of a pod, with the member index
@@ -203,7 +203,7 @@ The index is exact only if every writer of the destinations maintains it, this l
 
 All writes use `SADD` / `SREM` (atomic). Concurrent first-touch by two coordinators can produce a destination with two pods from the start. That's a valid steady state, not a corrupted one.
 
-A pod which called `member.setDraining(true)` is never picked, and the binding script refuses it even when it was picked from a list read before it started draining: the coordinator then picks another pod. The destinations it already holds keep resolving to it until it deregisters or moves them.
+A pod which called `member.setDraining(true)` is never picked, and the binding scripts refuse it even when it was picked from a list read before it started draining: `resolveDestination` then picks another pod, `addPodToDestination` returns `false`, and `pickAndRegister` answers 503 (`refusedMessage`, result `refused`), so that the caller retries on another pod. The flag is written again with the record of the pod when it expired. The destinations the pod already holds keep resolving to it until it deregisters or moves them.
 
 ## Allocation strategies
 

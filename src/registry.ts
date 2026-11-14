@@ -104,6 +104,36 @@ const resolveScript = `
   return { 'bound', { ARGV[2], address }, dead }
 `
 
+// Binds a member to a destination explicitly (addPodToDestination), unless the member is draining: refused atomically,
+// as by the resolve script, since the member can start draining after it was picked. With a member index (ARGV[3],
+// ARGV[4]), the destination is recorded in the set of the member.
+const bindScript = `
+  if redis.call('HGET', ARGV[1], 'draining') == '1' then
+    return 0
+  end
+
+  redis.call('SADD', KEYS[1], ARGV[2])
+
+  if ARGV[3] ~= '' then
+    redis.call('SADD', ARGV[3] .. ARGV[2], ARGV[4])
+  end
+
+  return 1
+`
+
+// Deletes a destination and, with a member index (ARGV[1], ARGV[2]), removes it from the sets of its members, in one
+// script: a member bound between a read and the deletion would otherwise keep a stale entry
+const deregisterScript = `
+  if ARGV[1] ~= '' then
+    for _, member in ipairs(redis.call('SMEMBERS', KEYS[1])) do
+      redis.call('SREM', ARGV[1] .. member, ARGV[2])
+    end
+  end
+
+  redis.call('DEL', KEYS[1])
+  return 1
+`
+
 // A candidate can expire between the pick and the script, in which case another one is picked
 const maxBindAttempts = 3
 
@@ -116,6 +146,8 @@ type ResolveReply =
 
 interface ResolveCommand {
   coordinatorResolve (key: string, memberPrefix: string, candidate: string, claim: string, reassign: string, ownedPrefix: string, destinationId: string): Promise<ResolveReply>
+  coordinatorBind (key: string, memberKey: string, memberId: string, ownedPrefix: string, destinationId: string): Promise<number>
+  coordinatorDeregister (key: string, ownedPrefix: string, destinationId: string): Promise<number>
 }
 
 export class Registry {
@@ -130,6 +162,8 @@ export class Registry {
   constructor (opts: RegistryOptions) {
     const { redis, owned } = connect(opts.redis, opts.redisOptions)
     redis.defineCommand('coordinatorResolve', { numberOfKeys: 1, lua: resolveScript })
+    redis.defineCommand('coordinatorBind', { numberOfKeys: 1, lua: bindScript })
+    redis.defineCommand('coordinatorDeregister', { numberOfKeys: 1, lua: deregisterScript })
     this.#redis = redis as Redis & ResolveCommand
     this.#ownsRedis = owned
     this.#keyPrefix = opts.keyPrefix ?? 'coordinator'
@@ -273,13 +307,12 @@ export class Registry {
     return { address: picked.address, memberId: picked.memberId, reassigned: false }
   }
 
-  async addPodToDestination (destinationId: string, memberId: string): Promise<void> {
-    if (this.#memberIndex) {
-      await this.#redis.multi().sadd(this.#destinationKey(destinationId), memberId).sadd(this.#ownedKey(memberId), destinationId).exec()
-    } else {
-      await this.#redis.sadd(this.#destinationKey(destinationId), memberId)
-    }
+  // Binds a member to a destination. Returns false when the member is draining, in which case nothing is bound: the
+  // member can start draining after it was picked.
+  async addPodToDestination (destinationId: string, memberId: string): Promise<boolean> {
+    const bound = await this.#redis.coordinatorBind(this.#destinationKey(destinationId), this.#memberKey(memberId), memberId, this.#ownedPrefix(), destinationId)
     if (this.#cache) this.#cache.delete(destinationId)
+    return bound === 1
   }
 
   // The destinations bound to a member, from the member index
@@ -305,15 +338,7 @@ export class Registry {
   }
 
   async deregisterDestination (destinationId: string): Promise<void> {
-    const key = this.#destinationKey(destinationId)
-    if (this.#memberIndex) {
-      const members = await this.#redis.smembers(key)
-      const multi = this.#redis.multi().del(key)
-      for (const memberId of members) multi.srem(this.#ownedKey(memberId), destinationId)
-      await multi.exec()
-    } else {
-      await this.#redis.del(key)
-    }
+    await this.#redis.coordinatorDeregister(this.#destinationKey(destinationId), this.#ownedPrefix(), destinationId)
     if (this.#cache) this.#cache.delete(destinationId)
   }
 

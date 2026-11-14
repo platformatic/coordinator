@@ -1,4 +1,4 @@
-import { strictEqual, ok } from 'node:assert'
+import { deepStrictEqual, strictEqual, ok } from 'node:assert'
 import { randomBytes } from 'node:crypto'
 import test from 'node:test'
 import Fastify from 'fastify'
@@ -140,6 +140,45 @@ test('Coordinator helpers', async (t) => {
     const set = await redis.smembers(destinationKey(body.resourceId))
     strictEqual(set.length, 1)
     ok(set[0] === memberId1 || set[0] === memberId2)
+  })
+
+  await t.test('pickAndRegister: refuses the binding when the pod started draining after it was picked', async () => {
+    // A pod which starts draining while it creates the resource
+    let created = 0
+    const draining = Fastify()
+    draining.post('/resources', async (_req, reply) => {
+      await redis.hset(memberKey('draining-pod'), 'draining', '1')
+      created++
+      return reply.code(201).send({ resourceId: 'r-draining' })
+    })
+    await draining.listen({ port: 0, host: '127.0.0.1' })
+    await makeLivePod(redis, 'draining-pod', `http://127.0.0.1:${(draining.server.address() as any).port}`)
+
+    const results: string[] = []
+    const picky = new Registry({
+      redis: REDIS_URL,
+      keyPrefix: PREFIX,
+      cache: false,
+      strategy: { pick: (candidates) => candidates.find(candidate => candidate.memberId === 'draining-pod') ?? null }
+    })
+    const app = Fastify()
+    await app.register(replyFrom)
+    app.post('/resources', pickAndRegister(picky, { registerIdFrom: (r: any) => r.resourceId, onResult: result => results.push(result) }))
+
+    try {
+      const res = await app.inject({ method: 'POST', url: '/resources' })
+      strictEqual(res.statusCode, 503)
+      ok((res.json() as any).error.includes('draining'))
+      deepStrictEqual(results, ['refused'])
+      strictEqual(created, 1)
+      strictEqual(await redis.exists(destinationKey('r-draining')), 0)
+    } finally {
+      await app.close()
+      await picky.close()
+      await draining.close()
+      await redis.srem(membersKey(), 'draining-pod')
+      await redis.del(memberKey('draining-pod'))
+    }
   })
 
   await t.test('pickAndRegister: returns 503 when no pods are available', async () => {

@@ -25,6 +25,7 @@ export class Member {
   #ttl: number
   #getLoad: () => number
   #memberIndex: boolean
+  #draining: boolean
 
   constructor (opts: MemberOptions) {
     const { redis, owned } = connect(opts.redis, opts.redisOptions)
@@ -36,6 +37,7 @@ export class Member {
     this.#ttl = opts.ttl ?? 30
     this.#getLoad = opts.getLoad ?? (() => 0)
     this.#memberIndex = opts.memberIndex ?? false
+    this.#draining = false
   }
 
   get memberId (): string {
@@ -79,9 +81,11 @@ export class Member {
   async #writeRecord (): Promise<void> {
     const pipeline = this.#redis.pipeline()
     pipeline.sadd(this.#membersKey(), this.#memberId)
+    // A record written again after it expired keeps the member draining
     pipeline.hset(this.#memberKey(), {
       address: this.#address,
-      load: String(this.#getLoad())
+      load: String(this.#getLoad()),
+      ...(this.#draining ? { draining: '1' } : {})
     })
     pipeline.expire(this.#memberKey(), this.#ttl)
     await pipeline.exec()
@@ -95,14 +99,20 @@ export class Member {
   }
 
   // A draining member keeps the destinations it holds, but is bound to no new one, nor reassigned any, until it
-  // resumes: the registry checks the flag atomically when it binds. The flag survives the heartbeats, and goes with
-  // the record when it expires or the member deregisters.
+  // resumes: the registry checks the flag atomically when it binds. The heartbeats keep the flag, and write it again
+  // with a record which expired; it goes when the member resumes or deregisters.
   async setDraining (draining: boolean): Promise<void> {
+    this.#draining = draining
+
     if (draining) {
       await this.#redis.hset(this.#memberKey(), 'draining', '1')
     } else {
       await this.#redis.hdel(this.#memberKey(), 'draining')
     }
+  }
+
+  get draining (): boolean {
+    return this.#draining
   }
 
   async addToDestination (destinationId: string): Promise<void> {

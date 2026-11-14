@@ -43,7 +43,15 @@ test('Member', async (t) => {
     await member.heartbeat()
     strictEqual(await sharedRedis.hget(memberKey(memberId), 'draining'), '1')
     deepStrictEqual((await member.listPeerLoad()).map(peer => [peer.memberId, peer.draining]), [[memberId, true]])
+
+    // A record which expired is written again with the flag
+    await sharedRedis.del(memberKey(memberId))
+    await member.heartbeat()
+    strictEqual(await sharedRedis.hget(memberKey(memberId), 'draining'), '1')
+    strictEqual(member.draining, true)
+
     await member.setDraining(false)
+    strictEqual(member.draining, false)
     strictEqual(await sharedRedis.hget(memberKey(memberId), 'draining'), null)
     deepStrictEqual((await member.listPeerLoad()).map(peer => [peer.memberId, peer.draining]), [[memberId, false]])
   })

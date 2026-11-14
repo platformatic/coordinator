@@ -239,6 +239,10 @@ test('Registry', async (t) => {
       // Without another member, nothing is bound
       await sharedRedis.hset(memberKey(m2), 'draining', '1')
       strictEqual(await registry.resolveDestination('inst-draining-none', { claimOnMiss: true }), null)
+
+      // An explicit binding is refused too
+      strictEqual(await registry.addPodToDestination('inst-draining-explicit', m1), false)
+      deepStrictEqual(await sharedRedis.exists(destinationKey('inst-draining-explicit')), 0)
     } finally {
       await sharedRedis.hdel(memberKey(m1), 'draining')
       await sharedRedis.hdel(memberKey(m2), 'draining')
@@ -276,7 +280,7 @@ test('Registry', async (t) => {
       deepStrictEqual(await sharedRedis.sismember(ownedKey(m1), 'inst-owned-pruned'), 1)
 
       // Explicit bindings and deregistrations maintain it too
-      await indexed.addPodToDestination('inst-owned-added', m2)
+      strictEqual(await indexed.addPodToDestination('inst-owned-added', m2), true)
       deepStrictEqual(await sharedRedis.sismember(ownedKey(m2), 'inst-owned-added'), 1)
       await indexed.deregisterDestination('inst-owned-added')
       deepStrictEqual(await sharedRedis.sismember(ownedKey(m2), 'inst-owned-added'), 0)
