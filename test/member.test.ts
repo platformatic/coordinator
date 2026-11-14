@@ -36,6 +36,18 @@ test('Member', async (t) => {
     await sharedRedis.quit()
   })
 
+  await t.test('setDraining marks the member in its record, across heartbeats, until it resumes', async () => {
+    await member.register()
+    await member.setDraining(true)
+    strictEqual(await sharedRedis.hget(memberKey(memberId), 'draining'), '1')
+    await member.heartbeat()
+    strictEqual(await sharedRedis.hget(memberKey(memberId), 'draining'), '1')
+    deepStrictEqual((await member.listPeerLoad()).map(peer => [peer.memberId, peer.draining]), [[memberId, true]])
+    await member.setDraining(false)
+    strictEqual(await sharedRedis.hget(memberKey(memberId), 'draining'), null)
+    deepStrictEqual((await member.listPeerLoad()).map(peer => [peer.memberId, peer.draining]), [[memberId, false]])
+  })
+
   await t.test('register adds member to set and writes hash with TTL', async () => {
     connections = 7
     await member.register()

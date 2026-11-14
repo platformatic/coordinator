@@ -86,6 +86,17 @@ export class Member {
     await pipeline.exec()
   }
 
+  // A draining member keeps the destinations it holds, but is bound to no new one, nor reassigned any, until it
+  // resumes: the registry checks the flag atomically when it binds. The flag survives the heartbeats, and goes with
+  // the record when it expires or the member deregisters.
+  async setDraining (draining: boolean): Promise<void> {
+    if (draining) {
+      await this.#redis.hset(this.#memberKey(), 'draining', '1')
+    } else {
+      await this.#redis.hdel(this.#memberKey(), 'draining')
+    }
+  }
+
   async addToDestination (destinationId: string): Promise<void> {
     await this.#redis.sadd(this.#destinationKey(destinationId), this.#memberId)
   }
@@ -116,7 +127,7 @@ export class Member {
 
     const pipeline = this.#redis.pipeline()
     for (const id of memberIds) {
-      pipeline.hmget(this.#memberKey(id), 'address', 'load')
+      pipeline.hmget(this.#memberKey(id), 'address', 'load', 'draining')
     }
     const results = await pipeline.exec()
     if (!results) return []
@@ -128,7 +139,7 @@ export class Member {
       const address = fields[0]
       if (!address) continue
       const load = parseInt(fields[1] ?? '0', 10) || 0
-      live.push({ memberId: memberIds[i], address, load })
+      live.push({ memberId: memberIds[i], address, load, draining: fields[2] === '1' })
     }
     return live
   }

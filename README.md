@@ -96,7 +96,7 @@ With `keyPrefix: 'myservice'`:
 | Key | Type | Owner | Purpose |
 |---|---|---|---|
 | `myservice:members` | set | pod | the set of memberIds known to be live |
-| `myservice:member:<memberId>` | hash with `address`, `load` | pod | live pod registration and load metric, TTL refreshed by heartbeat |
+| `myservice:member:<memberId>` | hash with `address`, `load` and, while draining, `draining` | pod | live pod registration and load metric, TTL refreshed by heartbeat |
 | `myservice:destination:<id>` | set of memberIds | coordinator + pod | pods currently serving this destination |
 | `myservice:lock:<lockId>` | hash with `podId`, `destinationId`, metadata | pod | lockId routing for transaction-bound calls |
 
@@ -132,6 +132,10 @@ await member.unregisterLock(lockId)
 const peers = await member.listPeerLoad()
 
 // Graceful shutdown:
+// Before stopping, stop receiving destinations while the ones held are moved or finished: the registry never binds a
+// draining pod, nor reassigns orphans to it, and listPeerLoad() reports the flag
+await member.setDraining(true)
+
 clearInterval(heartbeat)
 await member.deregister()
 await member.close()
@@ -169,7 +173,7 @@ if (lockRouting) {
 }
 
 // Other primitives:
-await registry.listLiveMembers()                  // [{ memberId, address, load }, ...]
+await registry.listLiveMembers()                  // [{ memberId, address, load, draining }, ...]
 await registry.pickMember({ destinationId: destId })
 await registry.addPodToDestination(destId, memberId)
 await registry.hasBinding(destId)
@@ -190,6 +194,8 @@ await registry.close()
 | All dead, non-empty | -- | true | Pick fresh, `SREM` dead + `SADD` fresh, return with `reassigned: true` |
 
 All writes use `SADD` / `SREM` (atomic). Concurrent first-touch by two coordinators can produce a destination with two pods from the start. That's a valid steady state, not a corrupted one.
+
+A pod which called `member.setDraining(true)` is never picked, and the binding script refuses it even when it was picked from a list read before it started draining: the coordinator then picks another pod. The destinations it already holds keep resolving to it until it deregisters or moves them.
 
 ## Allocation strategies
 

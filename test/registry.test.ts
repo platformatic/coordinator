@@ -188,6 +188,66 @@ test('Registry', async (t) => {
     }
   })
 
+  await t.test('resolveDestination never binds a draining member, even one picked before it started draining', async () => {
+    await sharedRedis.hset(memberKey(m1), 'draining', '1')
+
+    try {
+      // Draining members are not candidates
+      for (let i = 0; i < 5; i++) {
+        const resolved = await registry.resolveDestination(`inst-draining-${i}`, { claimOnMiss: true })
+        ok(resolved)
+        strictEqual(resolved.memberId, m2)
+      }
+
+      deepStrictEqual((await registry.listLiveMembers()).map(member => [member.memberId, member.draining]).sort(), [[m1, true], [m2, false]])
+
+      // A strategy which picked the member before it started draining: the binding is refused, and another member picked
+      let picks = 0
+      const picky = new Registry({
+        redis: REDIS_URL,
+        keyPrefix: PREFIX,
+        cache: false,
+        strategy: {
+          pick (candidates) {
+            if (picks++ === 0) return { memberId: m1, address: m1Address, load: 0 }
+            return candidates[0] ?? null
+          }
+        }
+      })
+
+      try {
+        const resolved = await picky.resolveDestination('inst-draining-race', { claimOnMiss: true })
+        ok(resolved)
+        strictEqual(resolved.memberId, m2)
+        strictEqual(picks, 2)
+        deepStrictEqual(await sharedRedis.smembers(destinationKey('inst-draining-race')), [m2])
+
+        // Orphans are not reassigned to it either
+        await sharedRedis.sadd(destinationKey('inst-draining-orphan'), 'dead-pod')
+        picks = 0
+        const reassigned = await picky.resolveDestination('inst-draining-orphan', { reassignOrphans: true })
+        ok(reassigned)
+        strictEqual(reassigned.memberId, m2)
+      } finally {
+        await picky.close()
+      }
+
+      // The destinations it holds are still served by it
+      await sharedRedis.sadd(destinationKey('inst-draining-held'), m1)
+      strictEqual((await registry.resolveDestination('inst-draining-held'))?.memberId, m1)
+
+      // Without another member, nothing is bound
+      await sharedRedis.hset(memberKey(m2), 'draining', '1')
+      strictEqual(await registry.resolveDestination('inst-draining-none', { claimOnMiss: true }), null)
+    } finally {
+      await sharedRedis.hdel(memberKey(m1), 'draining')
+      await sharedRedis.hdel(memberKey(m2), 'draining')
+      for (const id of ['inst-draining-race', 'inst-draining-orphan', 'inst-draining-held', ...Array.from({ length: 5 }, (_, i) => `inst-draining-${i}`)]) {
+        await sharedRedis.del(destinationKey(id))
+      }
+    }
+  })
+
   await t.test('resolveDestination with multi-pod set picks one live pod, cleans dead members in background', async () => {
     await sharedRedis.sadd(destinationKey('inst-multi'), m1, 'dead-pod', m2)
     const result = await registry.resolveDestination('inst-multi')

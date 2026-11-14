@@ -31,7 +31,7 @@ export interface ResolveLockResult {
 // members are pruned when at least one is live. Without a candidate (ARGV[2]) it only reports how many members the
 // set holds; with one, it binds the candidate when the set is empty (ARGV[3] = '1', claim) or when every member is dead
 // (ARGV[4] = '1', reassign). Concurrent resolutions therefore agree: a caller losing the race gets the members bound by
-// the winner instead of adding its own candidate.
+// the winner instead of adding its own candidate. A candidate which is draining is refused: the caller picks another.
 const resolveScript = `
   local members = redis.call('SMEMBERS', KEYS[1])
   local live = {}
@@ -63,12 +63,19 @@ const resolveScript = `
     return { 'empty', #members }
   end
 
-  local address = redis.call('HGET', ARGV[1] .. ARGV[2], 'address')
+  local fields = redis.call('HMGET', ARGV[1] .. ARGV[2], 'address', 'draining')
 
-  if not address then
+  if not fields[1] then
     return { 'stale' }
   end
 
+  -- A draining member receives no new destination: checked here, atomically with the binding, since the candidate
+  -- was picked from a list read before, when the member might not have been draining yet
+  if fields[2] == '1' then
+    return { 'draining' }
+  end
+
+  local address = fields[1]
   redis.call('DEL', KEYS[1])
   redis.call('SADD', KEYS[1], ARGV[2])
 
@@ -82,6 +89,7 @@ type ResolveReply =
   | ['live', string[]]
   | ['empty', number]
   | ['stale']
+  | ['draining']
   | ['bound', [string, string], string[]]
 
 interface ResolveCommand {
@@ -137,7 +145,7 @@ export class Registry {
 
     const pipeline = this.#redis.pipeline()
     for (const id of memberIds) {
-      pipeline.hmget(this.#memberKey(id), 'address', 'load')
+      pipeline.hmget(this.#memberKey(id), 'address', 'load', 'draining')
     }
     const results = await pipeline.exec()
     if (!results) return []
@@ -149,14 +157,17 @@ export class Registry {
       const address = fields[0]
       if (!address) continue
       const load = parseInt(fields[1] ?? '0', 10) || 0
-      live.push({ memberId: memberIds[i], address, load })
+      live.push({ memberId: memberIds[i], address, load, draining: fields[2] === '1' })
     }
     return live
   }
 
-  async pickMember (ctx: { destinationId?: string } = {}): Promise<MemberInfo | null> {
-    const live = await this.listLiveMembers()
-    return this.#strategy.pick(live, ctx)
+  // Picks a live member for a new destination with the strategy, among the members which are not draining, nor
+  // excluded: the members which refused the binding meanwhile
+  async pickMember (ctx: { destinationId?: string, exclude?: Iterable<string> } = {}): Promise<MemberInfo | null> {
+    const excluded = new Set(ctx.exclude ?? [])
+    const live = (await this.listLiveMembers()).filter(member => !member.draining && !excluded.has(member.memberId))
+    return this.#strategy.pick(live, { destinationId: ctx.destinationId })
   }
 
   async resolveDestination (
@@ -182,6 +193,8 @@ export class Registry {
     const reassign = opts.reassignOrphans ? '1' : '0'
 
     let reply = await this.#redis.coordinatorResolve(key, memberPrefix, '', claim, reassign)
+    const refused: string[] = []
+    let picked: MemberInfo | null = null
 
     for (let attempt = 0; attempt < maxBindAttempts; attempt++) {
       if (reply[0] === 'live') {
@@ -200,7 +213,12 @@ export class Registry {
         if (!wanted) return null
       }
 
-      const picked = await this.pickMember({ destinationId })
+      // A candidate which started draining after it was picked is not picked again
+      if (reply[0] === 'draining' && picked) {
+        refused.push(picked.memberId)
+      }
+
+      picked = await this.pickMember({ destinationId, exclude: refused })
       if (!picked) return null
 
       reply = await this.#redis.coordinatorResolve(key, memberPrefix, picked.memberId, claim, reassign)
