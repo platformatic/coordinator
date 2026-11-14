@@ -2,6 +2,8 @@ export interface MemberInfo {
   memberId: string
   address: string
   load: number
+  // A draining member keeps serving the destinations it holds, but receives no new ones
+  draining?: boolean
 }
 
 export interface PickContext {

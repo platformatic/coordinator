@@ -12,6 +12,12 @@ export interface RegistryOptions {
   strategy?: 'round-robin' | 'least-loaded' | 'random' | AllocationStrategy
   requestTimeout?: number
   cache?: CacheOptions | false
+  /**
+   * Maintains a set of the destinations bound to each member, `<keyPrefix>:owned:<memberId>`, atomically with every
+   * binding made by this registry, so that the destinations of a member are listed without scanning them all. Every
+   * writer of the destinations must maintain it, see the README.
+   */
+  memberIndex?: boolean
 }
 
 export interface ResolveResult {
@@ -31,7 +37,9 @@ export interface ResolveLockResult {
 // members are pruned when at least one is live. Without a candidate (ARGV[2]) it only reports how many members the
 // set holds; with one, it binds the candidate when the set is empty (ARGV[3] = '1', claim) or when every member is dead
 // (ARGV[4] = '1', reassign). Concurrent resolutions therefore agree: a caller losing the race gets the members bound by
-// the winner instead of adding its own candidate.
+// the winner instead of adding its own candidate. A candidate which is draining is refused: the caller picks another.
+// With a member index (ARGV[5] is its key prefix, ARGV[6] the destination), the sets of the members bound and unbound
+// are updated in the same script.
 const resolveScript = `
   local members = redis.call('SMEMBERS', KEYS[1])
   local live = {}
@@ -52,6 +60,12 @@ const resolveScript = `
   if #live > 0 then
     if #dead > 0 then
       redis.call('SREM', KEYS[1], unpack(dead))
+
+      if ARGV[5] ~= '' then
+        for _, member in ipairs(dead) do
+          redis.call('SREM', ARGV[5] .. member, ARGV[6])
+        end
+      end
     end
 
     return { 'live', live }
@@ -63,16 +77,61 @@ const resolveScript = `
     return { 'empty', #members }
   end
 
-  local address = redis.call('HGET', ARGV[1] .. ARGV[2], 'address')
+  local fields = redis.call('HMGET', ARGV[1] .. ARGV[2], 'address', 'draining')
 
-  if not address then
+  if not fields[1] then
     return { 'stale' }
   end
 
+  -- A draining member receives no new destination: checked here, atomically with the binding, since the candidate
+  -- was picked from a list read before, when the member might not have been draining yet
+  if fields[2] == '1' then
+    return { 'draining' }
+  end
+
+  local address = fields[1]
   redis.call('DEL', KEYS[1])
   redis.call('SADD', KEYS[1], ARGV[2])
 
+  if ARGV[5] ~= '' then
+    for _, member in ipairs(members) do
+      redis.call('SREM', ARGV[5] .. member, ARGV[6])
+    end
+
+    redis.call('SADD', ARGV[5] .. ARGV[2], ARGV[6])
+  end
+
   return { 'bound', { ARGV[2], address }, dead }
+`
+
+// Binds a member to a destination explicitly (addPodToDestination), unless the member is draining: refused atomically,
+// as by the resolve script, since the member can start draining after it was picked. With a member index (ARGV[3],
+// ARGV[4]), the destination is recorded in the set of the member.
+const bindScript = `
+  if redis.call('HGET', ARGV[1], 'draining') == '1' then
+    return 0
+  end
+
+  redis.call('SADD', KEYS[1], ARGV[2])
+
+  if ARGV[3] ~= '' then
+    redis.call('SADD', ARGV[3] .. ARGV[2], ARGV[4])
+  end
+
+  return 1
+`
+
+// Deletes a destination and, with a member index (ARGV[1], ARGV[2]), removes it from the sets of its members, in one
+// script: a member bound between a read and the deletion would otherwise keep a stale entry
+const deregisterScript = `
+  if ARGV[1] ~= '' then
+    for _, member in ipairs(redis.call('SMEMBERS', KEYS[1])) do
+      redis.call('SREM', ARGV[1] .. member, ARGV[2])
+    end
+  end
+
+  redis.call('DEL', KEYS[1])
+  return 1
 `
 
 // A candidate can expire between the pick and the script, in which case another one is picked
@@ -82,10 +141,13 @@ type ResolveReply =
   | ['live', string[]]
   | ['empty', number]
   | ['stale']
+  | ['draining']
   | ['bound', [string, string], string[]]
 
 interface ResolveCommand {
-  coordinatorResolve (key: string, memberPrefix: string, candidate: string, claim: string, reassign: string): Promise<ResolveReply>
+  coordinatorResolve (key: string, memberPrefix: string, candidate: string, claim: string, reassign: string, ownedPrefix: string, destinationId: string): Promise<ResolveReply>
+  coordinatorBind (key: string, memberKey: string, memberId: string, ownedPrefix: string, destinationId: string): Promise<number>
+  coordinatorDeregister (key: string, ownedPrefix: string, destinationId: string): Promise<number>
 }
 
 export class Registry {
@@ -94,11 +156,14 @@ export class Registry {
   #keyPrefix: string
   #strategy: AllocationStrategy
   #cache: TTLCache<string, ResolveResult> | null
+  #memberIndex: boolean
   readonly requestTimeout: number | undefined
 
   constructor (opts: RegistryOptions) {
     const { redis, owned } = connect(opts.redis, opts.redisOptions)
     redis.defineCommand('coordinatorResolve', { numberOfKeys: 1, lua: resolveScript })
+    redis.defineCommand('coordinatorBind', { numberOfKeys: 1, lua: bindScript })
+    redis.defineCommand('coordinatorDeregister', { numberOfKeys: 1, lua: deregisterScript })
     this.#redis = redis as Redis & ResolveCommand
     this.#ownsRedis = owned
     this.#keyPrefix = opts.keyPrefix ?? 'coordinator'
@@ -113,6 +178,7 @@ export class Registry {
       ? null
       : new TTLCache<string, ResolveResult>(opts.cache)
     this.requestTimeout = opts.requestTimeout
+    this.#memberIndex = opts.memberIndex ?? false
   }
 
   #membersKey (): string {
@@ -131,13 +197,22 @@ export class Registry {
     return `${this.#keyPrefix}:lock:${lockId}`
   }
 
+  // The prefix of the sets of the member index, or '' when the index is not maintained
+  #ownedPrefix (): string {
+    return this.#memberIndex ? `${this.#keyPrefix}:owned:` : ''
+  }
+
+  #ownedKey (memberId: string): string {
+    return `${this.#keyPrefix}:owned:${memberId}`
+  }
+
   async listLiveMembers (): Promise<MemberInfo[]> {
     const memberIds = await this.#redis.smembers(this.#membersKey())
     if (memberIds.length === 0) return []
 
     const pipeline = this.#redis.pipeline()
     for (const id of memberIds) {
-      pipeline.hmget(this.#memberKey(id), 'address', 'load')
+      pipeline.hmget(this.#memberKey(id), 'address', 'load', 'draining')
     }
     const results = await pipeline.exec()
     if (!results) return []
@@ -149,14 +224,17 @@ export class Registry {
       const address = fields[0]
       if (!address) continue
       const load = parseInt(fields[1] ?? '0', 10) || 0
-      live.push({ memberId: memberIds[i], address, load })
+      live.push({ memberId: memberIds[i], address, load, draining: fields[2] === '1' })
     }
     return live
   }
 
-  async pickMember (ctx: { destinationId?: string } = {}): Promise<MemberInfo | null> {
-    const live = await this.listLiveMembers()
-    return this.#strategy.pick(live, ctx)
+  // Picks a live member for a new destination with the strategy, among the members which are not draining, nor
+  // excluded: the members which refused the binding meanwhile
+  async pickMember (ctx: { destinationId?: string, exclude?: Iterable<string> } = {}): Promise<MemberInfo | null> {
+    const excluded = new Set(ctx.exclude ?? [])
+    const live = (await this.listLiveMembers()).filter(member => !member.draining && !excluded.has(member.memberId))
+    return this.#strategy.pick(live, { destinationId: ctx.destinationId })
   }
 
   async resolveDestination (
@@ -181,7 +259,10 @@ export class Registry {
     const claim = opts.claimOnMiss ? '1' : '0'
     const reassign = opts.reassignOrphans ? '1' : '0'
 
-    let reply = await this.#redis.coordinatorResolve(key, memberPrefix, '', claim, reassign)
+    const ownedPrefix = this.#ownedPrefix()
+    let reply = await this.#redis.coordinatorResolve(key, memberPrefix, '', claim, reassign, ownedPrefix, destinationId)
+    const refused: string[] = []
+    let picked: MemberInfo | null = null
 
     for (let attempt = 0; attempt < maxBindAttempts; attempt++) {
       if (reply[0] === 'live') {
@@ -200,10 +281,15 @@ export class Registry {
         if (!wanted) return null
       }
 
-      const picked = await this.pickMember({ destinationId })
+      // A candidate which started draining after it was picked is not picked again
+      if (reply[0] === 'draining' && picked) {
+        refused.push(picked.memberId)
+      }
+
+      picked = await this.pickMember({ destinationId, exclude: refused })
       if (!picked) return null
 
-      reply = await this.#redis.coordinatorResolve(key, memberPrefix, picked.memberId, claim, reassign)
+      reply = await this.#redis.coordinatorResolve(key, memberPrefix, picked.memberId, claim, reassign, ownedPrefix, destinationId)
     }
 
     return reply[0] === 'live' ? this.#pickLive(destinationId, reply[1]) : null
@@ -221,9 +307,17 @@ export class Registry {
     return { address: picked.address, memberId: picked.memberId, reassigned: false }
   }
 
-  async addPodToDestination (destinationId: string, memberId: string): Promise<void> {
-    await this.#redis.sadd(this.#destinationKey(destinationId), memberId)
+  // Binds a member to a destination. Returns false when the member is draining, in which case nothing is bound: the
+  // member can start draining after it was picked.
+  async addPodToDestination (destinationId: string, memberId: string): Promise<boolean> {
+    const bound = await this.#redis.coordinatorBind(this.#destinationKey(destinationId), this.#memberKey(memberId), memberId, this.#ownedPrefix(), destinationId)
     if (this.#cache) this.#cache.delete(destinationId)
+    return bound === 1
+  }
+
+  // The destinations bound to a member, from the member index
+  async listOwned (memberId: string): Promise<string[]> {
+    return this.#redis.smembers(this.#ownedKey(memberId))
   }
 
   async hasBinding (destinationId: string): Promise<boolean> {
@@ -244,7 +338,7 @@ export class Registry {
   }
 
   async deregisterDestination (destinationId: string): Promise<void> {
-    await this.#redis.del(this.#destinationKey(destinationId))
+    await this.#redis.coordinatorDeregister(this.#destinationKey(destinationId), this.#ownedPrefix(), destinationId)
     if (this.#cache) this.#cache.delete(destinationId)
   }
 

@@ -4,12 +4,14 @@ import type { FastifyReplyFromHooks } from '@fastify/reply-from'
 import '@fastify/reply-from'
 import type { Registry } from '../registry.ts'
 
-export type PickAndRegisterResult = 'spawned' | 'unavailable' | 'upstream_error'
+export type PickAndRegisterResult = 'spawned' | 'unavailable' | 'upstream_error' | 'refused'
 
 export interface PickAndRegisterOptions {
   registerIdFrom: (responseBody: any) => string
   expectedStatus?: number
   unavailableMessage?: string
+  /** The message of the 503 sent when the pod started draining after it was picked, so the binding was refused. */
+  refusedMessage?: string
   onResult?: (result: PickAndRegisterResult) => void
 }
 
@@ -21,6 +23,7 @@ export function pickAndRegister (
     registerIdFrom,
     expectedStatus = 201,
     unavailableMessage = 'No pods available',
+    refusedMessage = 'The pod started draining, retry',
     onResult
   } = opts
 
@@ -48,7 +51,15 @@ export function pickAndRegister (
         if (res.statusCode === expectedStatus) {
           const id = registerIdFrom(body)
           registry.addPodToDestination(id, member.memberId).then(
-            () => {
+            (bound) => {
+              // The pod started draining between the pick and the binding: the resource it created is not routable,
+              // the caller retries on another pod
+              if (!bound) {
+                onResult?.('refused')
+                replyOut.code(503).send({ error: refusedMessage })
+                return
+              }
+
               onResult?.('spawned')
               replyOut.send(body)
             },

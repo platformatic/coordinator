@@ -36,6 +36,46 @@ test('Member', async (t) => {
     await sharedRedis.quit()
   })
 
+  await t.test('setDraining marks the member in its record, across heartbeats, until it resumes', async () => {
+    await member.register()
+    await member.setDraining(true)
+    strictEqual(await sharedRedis.hget(memberKey(memberId), 'draining'), '1')
+    await member.heartbeat()
+    strictEqual(await sharedRedis.hget(memberKey(memberId), 'draining'), '1')
+    deepStrictEqual((await member.listPeerLoad()).map(peer => [peer.memberId, peer.draining]), [[memberId, true]])
+
+    // A record which expired is written again with the flag
+    await sharedRedis.del(memberKey(memberId))
+    await member.heartbeat()
+    strictEqual(await sharedRedis.hget(memberKey(memberId), 'draining'), '1')
+    strictEqual(member.draining, true)
+
+    await member.setDraining(false)
+    strictEqual(member.draining, false)
+    strictEqual(await sharedRedis.hget(memberKey(memberId), 'draining'), null)
+    deepStrictEqual((await member.listPeerLoad()).map(peer => [peer.memberId, peer.draining]), [[memberId, false]])
+  })
+
+  await t.test('a member with the index records the destinations it joins and leaves', async () => {
+    const indexed = new Member({ redis: REDIS_URL, memberId: 'indexed-member', address, keyPrefix: PREFIX, memberIndex: true })
+
+    try {
+      await indexed.addToDestination('dest-owned-1')
+      await indexed.addToDestination('dest-owned-2')
+      deepStrictEqual((await indexed.listOwned()).sort(), ['dest-owned-1', 'dest-owned-2'])
+      await indexed.removeFromDestination('dest-owned-1')
+      deepStrictEqual(await indexed.listOwned(), ['dest-owned-2'])
+      deepStrictEqual(await sharedRedis.smembers(destinationKey('dest-owned-2')), ['indexed-member'])
+
+      // Without the index, nothing is recorded
+      await member.addToDestination('dest-plain')
+      deepStrictEqual(await member.listOwned(), [])
+    } finally {
+      await indexed.close()
+      await sharedRedis.del(destinationKey('dest-owned-1'), destinationKey('dest-owned-2'), destinationKey('dest-plain'), `${PREFIX}:owned:indexed-member`)
+    }
+  })
+
   await t.test('register adds member to set and writes hash with TTL', async () => {
     connections = 7
     await member.register()

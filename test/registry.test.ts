@@ -188,6 +188,119 @@ test('Registry', async (t) => {
     }
   })
 
+  await t.test('resolveDestination never binds a draining member, even one picked before it started draining', async () => {
+    await sharedRedis.hset(memberKey(m1), 'draining', '1')
+
+    try {
+      // Draining members are not candidates
+      for (let i = 0; i < 5; i++) {
+        const resolved = await registry.resolveDestination(`inst-draining-${i}`, { claimOnMiss: true })
+        ok(resolved)
+        strictEqual(resolved.memberId, m2)
+      }
+
+      deepStrictEqual((await registry.listLiveMembers()).map(member => [member.memberId, member.draining]).sort(), [[m1, true], [m2, false]])
+
+      // A strategy which picked the member before it started draining: the binding is refused, and another member picked
+      let picks = 0
+      const picky = new Registry({
+        redis: REDIS_URL,
+        keyPrefix: PREFIX,
+        cache: false,
+        strategy: {
+          pick (candidates) {
+            if (picks++ === 0) return { memberId: m1, address: m1Address, load: 0 }
+            return candidates[0] ?? null
+          }
+        }
+      })
+
+      try {
+        const resolved = await picky.resolveDestination('inst-draining-race', { claimOnMiss: true })
+        ok(resolved)
+        strictEqual(resolved.memberId, m2)
+        strictEqual(picks, 2)
+        deepStrictEqual(await sharedRedis.smembers(destinationKey('inst-draining-race')), [m2])
+
+        // Orphans are not reassigned to it either
+        await sharedRedis.sadd(destinationKey('inst-draining-orphan'), 'dead-pod')
+        picks = 0
+        const reassigned = await picky.resolveDestination('inst-draining-orphan', { reassignOrphans: true })
+        ok(reassigned)
+        strictEqual(reassigned.memberId, m2)
+      } finally {
+        await picky.close()
+      }
+
+      // The destinations it holds are still served by it
+      await sharedRedis.sadd(destinationKey('inst-draining-held'), m1)
+      strictEqual((await registry.resolveDestination('inst-draining-held'))?.memberId, m1)
+
+      // Without another member, nothing is bound
+      await sharedRedis.hset(memberKey(m2), 'draining', '1')
+      strictEqual(await registry.resolveDestination('inst-draining-none', { claimOnMiss: true }), null)
+
+      // An explicit binding is refused too
+      strictEqual(await registry.addPodToDestination('inst-draining-explicit', m1), false)
+      deepStrictEqual(await sharedRedis.exists(destinationKey('inst-draining-explicit')), 0)
+    } finally {
+      await sharedRedis.hdel(memberKey(m1), 'draining')
+      await sharedRedis.hdel(memberKey(m2), 'draining')
+      for (const id of ['inst-draining-race', 'inst-draining-orphan', 'inst-draining-held', ...Array.from({ length: 5 }, (_, i) => `inst-draining-${i}`)]) {
+        await sharedRedis.del(destinationKey(id))
+      }
+    }
+  })
+
+  await t.test('the member index follows the bindings of the registry which maintains it', async () => {
+    const indexed = new Registry({ redis: REDIS_URL, keyPrefix: PREFIX, cache: false, memberIndex: true, strategy: 'round-robin' })
+    const ownedKey = (id: string): string => `${PREFIX}:owned:${id}`
+
+    try {
+      // Claims add the destination to the set of the member bound
+      const first = await indexed.resolveDestination('inst-owned-1', { claimOnMiss: true })
+      const second = await indexed.resolveDestination('inst-owned-2', { claimOnMiss: true })
+      ok(first && second)
+      deepStrictEqual((await indexed.listOwned(first.memberId)).includes('inst-owned-1'), true)
+      deepStrictEqual((await indexed.listOwned(second.memberId)).includes('inst-owned-2'), true)
+
+      // A reassignment moves the destination from the dead member to the new one
+      await sharedRedis.sadd(destinationKey('inst-owned-orphan'), 'dead-pod')
+      await sharedRedis.sadd(ownedKey('dead-pod'), 'inst-owned-orphan', 'inst-owned-pruned')
+      const reassigned = await indexed.resolveDestination('inst-owned-orphan', { reassignOrphans: true })
+      ok(reassigned)
+      deepStrictEqual(await sharedRedis.sismember(ownedKey('dead-pod'), 'inst-owned-orphan'), 0)
+      deepStrictEqual(await sharedRedis.sismember(ownedKey(reassigned.memberId), 'inst-owned-orphan'), 1)
+
+      // Pruning a dead member from a destination with live ones removes it from its set
+      await sharedRedis.sadd(destinationKey('inst-owned-pruned'), m1, 'dead-pod')
+      await sharedRedis.sadd(ownedKey(m1), 'inst-owned-pruned')
+      ok(await indexed.resolveDestination('inst-owned-pruned'))
+      deepStrictEqual(await sharedRedis.sismember(ownedKey('dead-pod'), 'inst-owned-pruned'), 0)
+      deepStrictEqual(await sharedRedis.sismember(ownedKey(m1), 'inst-owned-pruned'), 1)
+
+      // Explicit bindings and deregistrations maintain it too
+      strictEqual(await indexed.addPodToDestination('inst-owned-added', m2), true)
+      deepStrictEqual(await sharedRedis.sismember(ownedKey(m2), 'inst-owned-added'), 1)
+      await indexed.deregisterDestination('inst-owned-added')
+      deepStrictEqual(await sharedRedis.sismember(ownedKey(m2), 'inst-owned-added'), 0)
+      deepStrictEqual(await sharedRedis.exists(destinationKey('inst-owned-added')), 0)
+
+      // A registry without the index writes none of it
+      const plain = await registry.resolveDestination('inst-owned-plain', { claimOnMiss: true })
+      ok(plain)
+      deepStrictEqual(await sharedRedis.sismember(ownedKey(plain.memberId), 'inst-owned-plain'), 0)
+    } finally {
+      await indexed.close()
+      for (const id of ['inst-owned-1', 'inst-owned-2', 'inst-owned-orphan', 'inst-owned-pruned', 'inst-owned-added', 'inst-owned-plain']) {
+        await sharedRedis.del(destinationKey(id))
+      }
+      for (const id of [m1, m2, 'dead-pod']) {
+        await sharedRedis.del(ownedKey(id))
+      }
+    }
+  })
+
   await t.test('resolveDestination with multi-pod set picks one live pod, cleans dead members in background', async () => {
     await sharedRedis.sadd(destinationKey('inst-multi'), m1, 'dead-pod', m2)
     const result = await registry.resolveDestination('inst-multi')

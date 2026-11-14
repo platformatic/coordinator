@@ -96,8 +96,9 @@ With `keyPrefix: 'myservice'`:
 | Key | Type | Owner | Purpose |
 |---|---|---|---|
 | `myservice:members` | set | pod | the set of memberIds known to be live |
-| `myservice:member:<memberId>` | hash with `address`, `load` | pod | live pod registration and load metric, TTL refreshed by heartbeat |
+| `myservice:member:<memberId>` | hash with `address`, `load` and, while draining, `draining` | pod | live pod registration and load metric, TTL refreshed by heartbeat |
 | `myservice:destination:<id>` | set of memberIds | coordinator + pod | pods currently serving this destination |
+| `myservice:owned:<memberId>` | set of destination ids | coordinator + pod | the destinations of a pod, with the `memberIndex` option |
 | `myservice:lock:<lockId>` | hash with `podId`, `destinationId`, metadata | pod | lockId routing for transaction-bound calls |
 
 ## Pod side: `Member`
@@ -132,6 +133,10 @@ await member.unregisterLock(lockId)
 const peers = await member.listPeerLoad()
 
 // Graceful shutdown:
+// Before stopping, stop receiving destinations while the ones held are moved or finished: the registry never binds a
+// draining pod, nor reassigns orphans to it, and listPeerLoad() reports the flag
+await member.setDraining(true)
+
 clearInterval(heartbeat)
 await member.deregister()
 await member.close()
@@ -169,13 +174,20 @@ if (lockRouting) {
 }
 
 // Other primitives:
-await registry.listLiveMembers()                  // [{ memberId, address, load }, ...]
+await registry.listLiveMembers()                  // [{ memberId, address, load, draining }, ...]
 await registry.pickMember({ destinationId: destId })
-await registry.addPodToDestination(destId, memberId)
+await registry.addPodToDestination(destId, memberId)  // false when the pod is draining: nothing is bound
 await registry.hasBinding(destId)
 await registry.deregisterDestination(destId)
+await registry.listOwned(memberId)                // the destinations of a pod, with the member index
 await registry.close()
 ```
+
+### Member index
+
+With `memberIndex: true`, on the `Registry` and on every `Member`, each binding also records the destination in the set of the pod, `myservice:owned:<memberId>`, in the same script or transaction: claims and reassignments add it to the new pod and remove it from the pods unbound, pruning a dead pod removes it, `addPodToDestination`, `deregisterDestination`, `member.addToDestination()` and `member.removeFromDestination()` do the same. `registry.listOwned(memberId)` and `member.listOwned()` read the set, so that the destinations of a pod are listed without scanning them all, i.e. to move them before the pod stops.
+
+The index is exact only if every writer of the destinations maintains it, this library and any script of the application alike: enable it everywhere at once, and fill the sets of the destinations bound before, with a scan, before relying on it.
 
 ## Resolution and failover
 
@@ -190,6 +202,8 @@ await registry.close()
 | All dead, non-empty | -- | true | Pick fresh, `SREM` dead + `SADD` fresh, return with `reassigned: true` |
 
 All writes use `SADD` / `SREM` (atomic). Concurrent first-touch by two coordinators can produce a destination with two pods from the start. That's a valid steady state, not a corrupted one.
+
+A pod which called `member.setDraining(true)` is never picked, and the binding scripts refuse it even when it was picked from a list read before it started draining: `resolveDestination` then picks another pod, `addPodToDestination` returns `false`, and `pickAndRegister` answers 503 (`refusedMessage`, result `refused`), so that the caller retries on another pod. The flag is written again with the record of the pod when it expired. The destinations the pod already holds keep resolving to it until it deregisters or moves them.
 
 ## Allocation strategies
 
